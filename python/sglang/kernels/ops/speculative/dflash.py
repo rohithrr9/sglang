@@ -299,6 +299,47 @@ def _prepare_dflash_draft_block_unchecked(
     )
 
 
+@triton.jit(do_not_specialize=["t_stride", "k_stride", "bs"])
+def _stage_sampling_params_kernel(
+    t_src, t_stride, t_dst, k_src, k_stride, g_dst, lo, bs, BLOCK: tl.constexpr
+):
+    """temperatures: t_dst[i] = lo if t[i] < lo else t[i] (NaN kept, as torch.clamp(min=lo)); greedy_mask: g_dst[i] =
+    (top_ks[i] <= 1)."""
+    i = tl.arange(0, BLOCK)
+    m = i < bs
+    x = tl.load(t_src + i * t_stride, mask=m)
+    tl.store(t_dst + i, tl.where(x < lo, lo, x), mask=m)
+    k = tl.load(k_src + i * k_stride, mask=m)
+    tl.store(g_dst + i, k <= 1, mask=m)
+
+
+def stage_sampling_params(
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    temperatures_out: torch.Tensor,
+    greedy_mask_out: torch.Tensor,
+    lo: float,
+) -> None:
+    """``temperatures_out = clamp(temperatures, min=lo)`` and ``greedy_mask_out =
+    top_ks <= 1`` in one launch, bit-identical to the three torch ops.
+
+    ``temperatures`` float32 and ``top_ks`` int32, ``[bs]`` with any stride;
+    ``temperatures_out`` float32 and ``greedy_mask_out`` bool, contiguous ``[bs]``.
+    """
+    bs = int(temperatures_out.shape[0])
+    _stage_sampling_params_kernel[(1,)](
+        temperatures,
+        int(temperatures.stride(0)),
+        temperatures_out,
+        top_ks,
+        int(top_ks.stride(0)),
+        greedy_mask_out,
+        float(lo),
+        bs,
+        triton.next_power_of_2(max(bs, 16)),
+    )
+
+
 @triton.jit
 def _selector_walk_kernel(
     scores_ptr,

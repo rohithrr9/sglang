@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
     _prepare_dflash_mamba_commit,
     compute_dflash_correct_drafts_and_bonus,
+    stage_sampling_params,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
@@ -377,6 +378,10 @@ def _walked_confidence(
     )
 
 
+# The selector draft samples at no temperature below this.
+_SELECTOR_MIN_TEMPERATURE = 1e-5
+
+
 class _SelectorDraftSampler:
     """Selector decode folded into the draft cuda graph.
 
@@ -405,6 +410,10 @@ class _SelectorDraftSampler:
         # baked into the captured graph.
         self.temperatures = torch.ones((max_bs,), dtype=torch.float32, device=device)
         self.greedy_mask = torch.ones((max_bs,), dtype=torch.bool, device=device)
+        self._stage_in_one_launch = (
+            envs.SGLANG_OPT_DFLASH_ONE_LAUNCH_SAMPLER_STAGE.get()
+            and self.temperatures.is_cuda
+        )
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device
@@ -428,9 +437,13 @@ class _SelectorDraftSampler:
             self.temperatures[:bs].fill_(1.0)
             self.greedy_mask[:bs].fill_(True)
             return
+        if self._stage_in_one_launch and self._stage_one_launch(
+            bs=bs, sampling_info=sampling_info
+        ):
+            return
         torch.clamp(
             sampling_info.temperatures.view(-1)[:bs].to(torch.float32),
-            min=1e-5,
+            min=_SELECTOR_MIN_TEMPERATURE,
             out=self.temperatures[:bs],
         )
         self.greedy_mask[:bs].copy_(
@@ -438,6 +451,29 @@ class _SelectorDraftSampler:
                 bs=bs, sampling_info=sampling_info, device=self.greedy_mask.device
             )
         )
+
+    def _stage_one_launch(self, *, bs: int, sampling_info) -> bool:
+        """False, with nothing written, unless the batch's params have the layout the
+        kernel reads; the result is bit-identical to the three-op path."""
+        temperatures = sampling_info.temperatures.view(-1)[:bs]
+        top_ks = sampling_info.top_ks.view(-1)
+        if (
+            temperatures.dtype != torch.float32
+            or top_ks.dtype != torch.int32
+            or temperatures.shape[0] != bs
+            or top_ks.shape[0] != bs
+            or temperatures.device != self.temperatures.device
+            or top_ks.device != self.temperatures.device
+        ):
+            return False
+        stage_sampling_params(
+            temperatures,
+            top_ks,
+            self.temperatures[:bs],
+            self.greedy_mask[:bs],
+            lo=_SELECTOR_MIN_TEMPERATURE,
+        )
+        return True
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size

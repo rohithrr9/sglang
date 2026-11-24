@@ -1919,6 +1919,11 @@ class Envs:
     SGLANG_OPT_DFLASH_DRAFT_TOKENS_ALIAS = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The DFLASH selector draft sampler stages its temperatures and greedy mask in one
+    # launch instead of three.
+    SGLANG_OPT_DFLASH_ONE_LAUNCH_SAMPLER_STAGE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

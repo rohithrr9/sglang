@@ -346,6 +346,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
     sampler = worker_mod._SelectorDraftSampler.__new__(worker_mod._SelectorDraftSampler)
     sampler.temperatures = torch.zeros(1)
     sampler.greedy_mask = torch.zeros(1, dtype=torch.bool)
+    sampler._stage_in_one_launch = False
     sampler.sampling_enabled = False
     sampler.stage_sampling_params(bs=1, sampling_info=sampling_info)
     torch.testing.assert_close(sampler.temperatures, torch.ones(1))
