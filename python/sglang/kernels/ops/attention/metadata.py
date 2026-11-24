@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Sequence, Tuple
 
 import torch
 import triton
@@ -655,6 +655,285 @@ def normal_decode_set_metadata(
         num_warps=block_cols // 32,
         num_stages=3,
     )
+
+
+# Elements per program of a copy in _fill_slots_decode_metadata_kernel.
+_FILL_BLOCK = 1024
+
+
+@triton.jit(
+    do_not_specialize=[
+        "sizes",
+        "strides",
+        "slot_off",
+        "slot_cap",
+        "B",
+        "max_seq_pages",
+    ],
+    do_not_specialize_on_alignment=["sizes", "strides", "slot_off", "slot_cap"],
+)
+def _fill_slots_decode_metadata_kernel(
+    srcs,
+    dsts,
+    sizes,
+    strides,
+    NF: tl.constexpr,
+    slot_src,
+    slot_dst,
+    slot_off,
+    slot_cap,
+    SLOT: tl.constexpr,
+    FB: tl.constexpr,
+    seq_lens,
+    seq_lens_stride_0,
+    req_to_token,
+    req_to_token_stride_0,
+    req_to_token_stride_1,
+    req_pool_indices,
+    req_pool_indices_stride_0,
+    cache_seqlens_int32,
+    cache_seqlens_int32_stride_0,
+    cu_seqlens_k,
+    cu_seqlens_k_stride_0,
+    page_table,
+    page_table_stride_0,
+    page_table_stride_1,
+    B,
+    max_seq_pages,
+    PAGE_SIZE: tl.constexpr,
+    SEQ_LEN_DELTA: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    """Programs (b, c) with b < B: the decode metadata kernel's work for row b, page columns [c * BLOCK_COLS, ...);
+    program (0, 0) also writes the lengths and their prefix sum. Programs (B + f, c): copy f < NF moves elements
+    [c * FB, (c + 1) * FB) of srcs[f] to dsts[f] as _fill_kernel does; program (B + NF, 0) writes the slot."""
+    pid_b = tl.program_id(0)
+    pid_c = tl.program_id(1)
+    if pid_b >= B:
+        f = pid_b - B
+        offs = pid_c * FB + tl.arange(0, FB)
+        for i in tl.static_range(NF):
+            if f == i:
+                m = offs < sizes[i]
+                v = tl.load(srcs[i] + offs.to(tl.int64) * strides[i], mask=m)
+                tl.store(dsts[i] + offs, v.to(dsts[i].dtype.element_ty), mask=m)
+        if SLOT != 0:
+            if f == NF:
+                if pid_c == 0:
+                    g = tl.load(slot_src)
+                    if SLOT == 2:
+                        g = g - slot_off
+                        g = tl.minimum(tl.maximum(g, 0), slot_cap)
+                    tl.store(slot_dst, g)
+        return
+
+    # The decode metadata kernel's body (lengths, prefix sum, page table of the live columns).
+    if pid_b == 0 and pid_c == 0:
+        acc = 0
+        for idx in range(B):
+            seq = tl.load(seq_lens + idx * seq_lens_stride_0)
+            val = (seq + SEQ_LEN_DELTA).to(tl.int32)
+            tl.store(cache_seqlens_int32 + idx * cache_seqlens_int32_stride_0, val)
+            tl.store(cu_seqlens_k + idx * cu_seqlens_k_stride_0, acc)
+            acc += val
+        tl.store(cu_seqlens_k + B * cu_seqlens_k_stride_0, acc)
+
+    seq_len = tl.load(seq_lens + pid_b * seq_lens_stride_0).to(tl.int32)
+    num_live_pages = tl.minimum(
+        tl.cdiv(seq_len + SEQ_LEN_DELTA, PAGE_SIZE), max_seq_pages
+    )
+    col_start = pid_c * BLOCK_COLS
+    if col_start >= num_live_pages:
+        return
+
+    row_idx = tl.load(req_pool_indices + pid_b * req_pool_indices_stride_0)
+    cols = col_start + tl.arange(0, BLOCK_COLS)
+    live_mask = cols < num_live_pages
+    token_ids = tl.load(
+        req_to_token
+        + row_idx * req_to_token_stride_0
+        + cols * PAGE_SIZE * req_to_token_stride_1,
+        mask=live_mask,
+        other=0,
+        cache_modifier=".cg",
+    )
+    tl.store(
+        page_table + pid_b * page_table_stride_0 + cols * page_table_stride_1,
+        token_ids // PAGE_SIZE,
+        mask=live_mask,
+        cache_modifier=".cg",
+    )
+
+
+# (storage, first byte, end byte) of a tensor with non-negative strides.
+_ByteExtent = Tuple[int, int, int]
+
+
+def _byte_extent(t: torch.Tensor) -> _ByteExtent:
+    storage = t.untyped_storage().data_ptr()
+    if t.numel() == 0:
+        return storage, 0, 0
+    extent = 1 + sum((n - 1) * s for n, s in zip(t.shape, t.stride()))
+    return storage, t.data_ptr(), t.data_ptr() + extent * t.element_size()
+
+
+def _overlap(a: _ByteExtent, b: _ByteExtent) -> bool:
+    return a[0] == b[0] and a[1] < b[2] and b[1] < a[2]
+
+
+def _read_after_copies(
+    t: torch.Tensor,
+    pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    written: Sequence[_ByteExtent],
+) -> Optional[torch.Tensor]:
+    """What a read of ``t`` after the copies sees, read before them: the source of the
+    copy whose destination is exactly ``t``, ``t`` itself when no write touches it, or
+    None (a partial overlap, or a converting copy). ``written``: the destinations'
+    extents, then the slot's."""
+    if t.dim() != 1 or t.dtype not in (torch.int32, torch.int64):
+        return None
+    span = _byte_extent(t)
+    for i, w in enumerate(written):
+        if not _overlap(w, span):
+            continue
+        if i == len(pairs):
+            return None
+        dst, src = pairs[i]
+        exact = (
+            dst.data_ptr() == t.data_ptr()
+            and dst.shape == t.shape
+            and dst.stride() == t.stride()
+            and dst.dtype == t.dtype
+            and src.dtype == dst.dtype
+            and src.shape == dst.shape
+        )
+        return src if exact else None
+    return t
+
+
+def fill_slots_then_decode_metadata(
+    pairs: Sequence[Tuple[torch.Tensor, torch.Tensor]],
+    slot,
+    *,
+    cache_seqlens_int32: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    page_table: torch.Tensor,
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    max_seq_pages: int,
+    seq_lens: torch.Tensor,
+    seq_len_delta: int,
+    page_size: int,
+) -> bool:
+    """``fill_slots(pairs, slot)`` (``sglang.kernels.ops.memory.slot_fill``), then
+    ``normal_decode_set_metadata`` without sliding-window table, page mapping or tail
+    zeroing, in one launch with the same bytes written.
+
+    An input of the metadata that is exactly a copy's destination is read from that
+    copy's source. False, with nothing launched, when the two cannot share a launch:
+    no copy, an input partly written by a copy, outputs overlapping any other operand,
+    or layouts the metadata kernel does not take.
+    """
+    if not pairs or max_seq_pages <= 0 or page_size <= 0 or page_size & (page_size - 1):
+        return False
+    b = int(cache_seqlens_int32.shape[0]) if cache_seqlens_int32.dim() == 1 else 0
+    device = pairs[0][0].device
+    if (
+        b < 1
+        or cache_seqlens_int32.dtype != torch.int32
+        or cu_seqlens_k.dim() != 1
+        or cu_seqlens_k.dtype != torch.int32
+        or cu_seqlens_k.shape[0] < b + 1
+        or page_table.dim() != 2
+        or page_table.dtype != torch.int32
+        or page_table.shape[0] < b
+        or page_table.shape[1] < max_seq_pages
+        or req_to_token.dim() != 2
+        or req_to_token.dtype not in (torch.int32, torch.int64)
+        or any(
+            t.device != device
+            for t in (cache_seqlens_int32, cu_seqlens_k, page_table, req_to_token)
+        )
+    ):
+        return False
+    written = [_byte_extent(dst) for dst, _ in pairs]
+    read = [_byte_extent(src) for _, src in pairs]
+    if slot is not None:
+        written.append(_byte_extent(slot[0]))
+        read.append(_byte_extent(slot[1]))
+    seq_lens = _read_after_copies(seq_lens, pairs, written)
+    req_pool_indices = _read_after_copies(req_pool_indices, pairs, written)
+    if seq_lens is None or req_pool_indices is None:
+        return False
+    if (
+        seq_lens.shape[0] != b
+        or req_pool_indices.shape[0] != b
+        or seq_lens.device != device
+        or req_pool_indices.device != device
+    ):
+        return False
+    # No part of the launch may read or write what another part writes.
+    table = _byte_extent(req_to_token)
+    read += [_byte_extent(seq_lens), _byte_extent(req_pool_indices), table]
+    outputs = [_byte_extent(t) for t in (cache_seqlens_int32, cu_seqlens_k, page_table)]
+    for i, out in enumerate(outputs):
+        if any(_overlap(out, other) for other in written + read):
+            return False
+        if any(_overlap(out, other) for j, other in enumerate(outputs) if j != i):
+            return False
+    if any(_overlap(table, w) for w in written):
+        return False
+
+    dsts = tuple(d for d, _ in pairs)
+    srcs = tuple(s for _, s in pairs)
+    sizes = tuple(int(d.numel()) for d in dsts)
+    strides = tuple(int(s.stride(0)) for s in srcs)
+    mode, s_dst, s_src, off, cap = 0, dsts[0], dsts[0], 0, 0
+    if slot is not None:
+        s_dst, s_src, mode, off, cap = slot
+    # The stock launcher's column block for this form.
+    block_cols = 256 if page_size == 1 else 128
+    grid = (
+        b + len(pairs) + (1 if mode else 0),
+        max(
+            triton.cdiv(max_seq_pages, block_cols), triton.cdiv(max(sizes), _FILL_BLOCK)
+        ),
+    )
+    _fill_slots_decode_metadata_kernel[grid](
+        srcs,
+        dsts,
+        sizes,
+        strides,
+        len(pairs),
+        s_src,
+        s_dst,
+        int(off),
+        int(cap),
+        mode,
+        _FILL_BLOCK,
+        seq_lens,
+        seq_lens.stride(0),
+        req_to_token,
+        req_to_token.stride(0),
+        req_to_token.stride(1),
+        req_pool_indices,
+        req_pool_indices.stride(0),
+        cache_seqlens_int32,
+        cache_seqlens_int32.stride(0),
+        cu_seqlens_k,
+        cu_seqlens_k.stride(0),
+        page_table,
+        page_table.stride(0),
+        page_table.stride(1),
+        b,
+        int(max_seq_pages),
+        PAGE_SIZE=page_size,
+        SEQ_LEN_DELTA=seq_len_delta,
+        BLOCK_COLS=block_cols,
+        num_warps=block_cols // 32,
+        num_stages=3,
+    )
+    return True
 
 
 @triton.jit

@@ -31,6 +31,8 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.memory import slot_fill
+from sglang.srt.model_executor.cuda_graph_buffer_registry import RecordedFill
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -709,6 +711,182 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=0, padded_glue=True)
         self.assertEqual((glue.calls, eager), ([], views))
+
+
+def _fill_slots_on_host(pairs, slot=None):
+    for dst, src in pairs:
+        dst.copy_(src)
+    if slot is not None:
+        dst, src, mode, offset, cap = slot
+        dst.copy_(src if mode == 1 else (src - offset).clamp(0, cap))
+
+
+class _HoldingBackend:
+    """The FlashAttention backend's side of a held draft load."""
+
+    def __init__(self):
+        self.held, self.taken = None, []
+
+    def hold_replay_input_copies(self, copies):
+        self.held = copies
+
+    def take_replay_input_copies(self):
+        copies, self.held = self.held, None
+        return copies
+
+
+class _RecordingRegistry:
+    def __init__(self, recorded):
+        self.recorded, self.calls = recorded, []
+
+    def record_fill(self, forward_batch, **kwargs):
+        self.calls.append("record")
+        return self.recorded
+
+    def fill_from(self, forward_batch, **kwargs):
+        self.calls.append("fill")
+
+
+class TestDraftLoadHeldForMetadata(CustomTestCase):
+    """SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD: a held DFLASH draft load writes its slots
+    and input_embeds only through the copies it hands the attention backend, and what
+    the backend's prep leaves is launched before the load returns."""
+
+    def _load(self, *, prep="take", holds=True, records=True, **batch_fields):
+        ids_slot = torch.full((8,), -1)
+        fb = SimpleNamespace(
+            needs_forward_metadata_init=lambda: True,
+            batch_size=2,
+            forward_mode=mod.ForwardMode.TARGET_VERIFY,
+            ragged_verify_layout=None,
+            input_ids=torch.arange(8) + 100,
+            input_embeds=torch.randn(8, 4),
+            spec_info=None,
+        )
+        fb.__dict__.update(batch_fields)
+        backend = _HoldingBackend()
+        registry = _RecordingRegistry(
+            RecordedFill(pairs=[(ids_slot, fb.input_ids)]) if records else None
+        )
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.dllm_uses_input_embeds = False
+        runner.dllm_input_preparation = None
+        runner.ragged_verify_mode = False
+        runner.enable_two_batch_overlap = False
+        runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
+        runner.captured_req_width, runner.capture_bs = 4, [2]
+        runner.require_mlp_tp_gather = False
+        runner._restage_skip = runner._skips_prefilled_inputs = False
+        runner._early_verify_metadata = None
+        runner.model_runner = SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash_family=lambda: True),
+            is_draft_worker=True,
+            hisparse_coordinator=None,
+        )
+        runner.buffers = SimpleNamespace(input_embeds=torch.full((8, 4), 7.0))
+        runner.buffer_registry = registry
+        runner._draft_load_metadata_backend = backend if holds else None
+        for name, stub in dict(
+            _validate_capture_hidden_mode=lambda fb: None,
+            _capture_graph_size=lambda **_: 2,
+            _resolve_attention_variant=lambda *_: None,
+            _glue_key=lambda *key: key,
+            _take_early_verify_metadata=lambda *_, **__: False,
+            _set_dp_real_num_tokens=lambda _: None,
+            _resolve_lora_variant=lambda _: None,
+            _make_graph_key=lambda *key: key,
+            _with_logits_variant=lambda key, _: key,
+            _resolve_logits_variant=lambda *_, **__: None,
+            _replay_pads_rows=lambda **_: False,
+        ).items():
+            setattr(runner, name, stub)
+
+        def init_replay_attn_metadata(forward_batch, **kwargs):
+            if prep == "raise":
+                raise RuntimeError("metadata prep")
+            if prep == "take":
+                backend.taken.append(backend.take_replay_input_copies())
+
+        runner._init_replay_attn_metadata = init_replay_attn_metadata
+        launches = []
+
+        def fill_slots(pairs, slot=None):
+            launches.append(list(pairs))
+            _fill_slots_on_host(pairs, slot)
+
+        with mock.patch.object(slot_fill, "fill_slots", fill_slots):
+            try:
+                runner.load_batch(fb)
+            except RuntimeError:
+                self.assertEqual(prep, "raise")
+        return SimpleNamespace(
+            fb=fb,
+            ids_slot=ids_slot,
+            embeds=runner.buffers.input_embeds,
+            registry=registry,
+            backend=backend,
+            launches=launches,
+        )
+
+    def test_held_load_writes_only_through_the_copies_it_hands_over(self):
+        load = self._load()
+        self.assertEqual(load.registry.calls, ["record"])
+        self.assertEqual((load.launches, load.backend.held), ([], None))
+        # Neither the slots nor the embedding rows are written before the backend's launch.
+        self.assertTrue(torch.all(load.embeds == 7.0))
+        [taken] = load.backend.taken
+        _fill_slots_on_host(taken.pairs, taken.scalar)
+        self.assertTrue(torch.equal(load.ids_slot, load.fb.input_ids))
+        self.assertTrue(torch.equal(load.embeds, load.fb.input_embeds))
+
+    def test_copies_the_prep_leaves_launch_before_the_load_returns(self):
+        for prep in ("leave", "raise"):
+            with self.subTest(prep=prep):
+                load = self._load(prep=prep)
+                self.assertEqual((len(load.launches), load.backend.held), (1, None))
+                self.assertTrue(torch.equal(load.ids_slot, load.fb.input_ids))
+                self.assertTrue(torch.equal(load.embeds, load.fb.input_embeds))
+
+    def test_loads_that_hold_nothing_fill_as_before(self):
+        unaligned = torch.randn(33)[1:].view(8, 4)
+        misses = {
+            "fold off": (dict(holds=False), ["fill"]),
+            "not a verify batch": (dict(forward_mode=mod.ForwardMode.DECODE), ["fill"]),
+            "ragged layout": (dict(ragged_verify_layout=object()), ["fill"]),
+            "rows without a word copy": (dict(input_embeds=unaligned), ["fill"]),
+            "fill not one launch": (dict(records=False), ["record", "fill"]),
+        }
+        for name, (kwargs, calls) in misses.items():
+            with self.subTest(miss=name):
+                load = self._load(**kwargs)
+                self.assertEqual(load.registry.calls, calls)
+                self.assertEqual((load.launches, load.backend.held), ([], None))
+                self.assertTrue(torch.equal(load.embeds, load.fb.input_embeds))
+
+    def test_word_views_copy_the_same_bytes(self):
+        for dtype, shape in (
+            (torch.bfloat16, (8, 12)),
+            (torch.float16, (4,)),
+            (torch.float32, (3, 2)),
+        ):
+            with self.subTest(dtype=dtype):
+                src = torch.randn(shape).to(dtype)
+                dst = torch.zeros(shape, dtype=dtype)
+                words = mod._copy_as_words(dst, src)
+                words[0].copy_(words[1])
+                self.assertTrue(torch.equal(dst.view(-1), src.view(-1)))
+        buf = torch.zeros(16, dtype=torch.float16)
+        misses = {
+            "shape": (torch.zeros(8), torch.zeros(4, 2)),
+            "dtype": (torch.zeros(4), torch.zeros(4, dtype=torch.int32)),
+            "strided": (torch.zeros(4, 2), torch.zeros(2, 4).t()),
+            "bytes not whole words": (torch.zeros(3, dtype=torch.float16),) * 2,
+            "unaligned": (torch.zeros(4, dtype=torch.float16), buf[1:5]),
+            "overlap": (buf[:8], buf[4:12]),
+        }
+        for name, (dst, src) in misses.items():
+            with self.subTest(miss=name):
+                self.assertIsNone(mod._copy_as_words(dst, src))
 
 
 if __name__ == "__main__":

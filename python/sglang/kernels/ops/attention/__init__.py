@@ -33,6 +33,7 @@ _TRITON_KERNELS = [
     ("metadata", "get_num_kv_splits_triton"),
     ("metadata", "prepare_swa_spec_page_table_triton"),
     ("metadata", "normal_decode_set_metadata"),
+    ("metadata", "fill_slots_then_decode_metadata"),
     ("dsa.metadata", "fused_dsa_decode_metadata"),
     ("dsa.metadata", "fused_dsa_target_verify_metadata"),
     ("dsa.metadata", "fused_dsa_draft_extend_metadata"),

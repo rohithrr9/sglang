@@ -151,6 +151,37 @@ class TestFusedRegistryFill(CustomTestCase):
                             name,
                         )
 
+    def test_recorded_fill_writes_device_slots_only_at_its_launch(self):
+        """A recorded fill writes its host slots at once (fill_from is not called
+        after it) and its device slots only when launched, then as fill_from does."""
+        gen = torch.Generator("cuda").manual_seed(2)
+        batch = self._batch(gen, 4, "draft")
+        shape = dict(raw_bs=4, padded_bs=4, raw_num_tokens=32, padded_num_tokens=32)
+        stock, held = self._registry(fuse=False), self._registry(fuse=False)
+        stock.fill_from(batch, **shape)
+        recorded = held.record_fill(batch, **shape)
+        self.assertIsNotNone(recorded)
+        for name in held.slot_names():
+            buf = held.get_slot(name).buffer
+            want = stock.get_slot(name).buffer if buf.device.type == "cpu" else None
+            with self.subTest(name=name, launched=False):
+                if want is None:
+                    self.assertTrue(torch.all(buf == POISON % 1000003))
+                else:
+                    self.assertTrue(torch.equal(buf, want))
+        recorded.launch()
+        for name in held.slot_names():
+            with self.subTest(name=name, launched=True):
+                self.assertTrue(
+                    torch.equal(held.get_slot(name).buffer, stock.get_slot(name).buffer)
+                )
+        untouched = self._registry(fuse=False)
+        padded = dict(shape, padded_bs=8, padded_num_tokens=64)
+        self.assertIsNone(untouched.record_fill(batch, **padded))
+        for name in untouched.slot_names():
+            buf = untouched.get_slot(name).buffer
+            self.assertTrue(torch.all(buf == POISON % 1000003), name)
+
     def test_steps_aside_where_one_launch_differs(self):
         """Each miss would otherwise skip a write fill_from makes (padding resets, a
         side input), write a value differently (a gathered hook, a converted scalar, a

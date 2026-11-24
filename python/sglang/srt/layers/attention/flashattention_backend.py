@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.attention.metadata import (
     draft_extend_set_metadata,
+    fill_slots_then_decode_metadata,
     normal_decode_set_metadata,
     prepare_swa_spec_page_table_triton,
     prepare_tree_spec_metadata,
@@ -70,6 +71,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+    from sglang.srt.model_executor.cuda_graph_buffer_registry import RecordedFill
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
@@ -192,6 +194,8 @@ class FlashAttentionBackend(AttentionBackend):
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
     _draft_kv_ring: Optional[DFlashDraftKVRing] = None
     _ring_page_cols: Optional[torch.Tensor] = None
+    # A draft graph runner's slot copies, written by this replay's metadata launch.
+    _replay_input_copies: Optional[RecordedFill] = None
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
@@ -3276,6 +3280,30 @@ class FlashAttentionBackend(AttentionBackend):
         src = seq_lens_cpu if seq_lens_cpu is not None else seq_lens.cpu()
         return src.max().item()
 
+    def replay_input_copies_blocker(self) -> str:
+        """Empty if a top-k <= 1 target-verify replay's prep starts with one plain
+        ``normal_decode_set_metadata`` call, before any read of the replay inputs,
+        so the graph runner's slot copies can be held for its launch; else why not."""
+        if type(self) is not FlashAttentionBackend:
+            return "a FlashAttention backend subclass"
+        if self.topk > 1:
+            return "top-k > 1 verify metadata"
+        if self.use_sliding_window_kv_pool:
+            return "sliding-window page tables"
+        if self.runner_ids.reads_are_translated:
+            return "translated page tables"
+        if self._draft_kv_ring is not None:
+            return "the draft KV ring"
+        return ""
+
+    def hold_replay_input_copies(self, copies: RecordedFill) -> None:
+        """Hold the runner's slot copies for this replay's page metadata launch."""
+        self._replay_input_copies = copies
+
+    def take_replay_input_copies(self) -> Optional[RecordedFill]:
+        copies, self._replay_input_copies = self._replay_input_copies, None
+        return copies
+
     def _set_decode_page_metadata(
         self,
         plan: IterationIds,
@@ -3291,6 +3319,33 @@ class FlashAttentionBackend(AttentionBackend):
         """
         translated = self.runner_ids.reads_are_translated
         ring = self._draft_kv_ring is not None
+        full_to_swa_index_mapping = (
+            self.token_to_kv_pool.full_to_swa_index_mapping
+            if self.use_sliding_window_kv_pool and not self.runner_ids.is_translating
+            else None
+        )
+        copies = self.take_replay_input_copies()
+        if copies is not None:
+            if (
+                not (translated or ring)
+                and metadata.swa_page_table is None
+                and full_to_swa_index_mapping is None
+                and fill_slots_then_decode_metadata(
+                    copies.pairs,
+                    copies.scalar,
+                    cache_seqlens_int32=metadata.cache_seqlens_int32,
+                    cu_seqlens_k=metadata.cu_seqlens_k,
+                    page_table=metadata.page_table,
+                    req_to_token=self.req_to_token,
+                    req_pool_indices=req_pool_indices,
+                    max_seq_pages=self.max_num_pages,
+                    seq_lens=seq_lens,
+                    seq_len_delta=seq_len_delta,
+                    page_size=self.page_size,
+                )
+            ):
+                return
+            copies.launch()
         normal_decode_set_metadata(
             metadata.cache_seqlens_int32,
             metadata.cu_seqlens_k,
@@ -3302,12 +3357,7 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len_delta,
             self.page_size,
             metadata.swa_page_table,
-            full_to_swa_index_mapping=(
-                self.token_to_kv_pool.full_to_swa_index_mapping
-                if self.use_sliding_window_kv_pool
-                and not self.runner_ids.is_translating
-                else None
-            ),
+            full_to_swa_index_mapping=full_to_swa_index_mapping,
             skip_page_table=translated or ring,
         )
         if ring:

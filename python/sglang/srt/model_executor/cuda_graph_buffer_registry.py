@@ -171,6 +171,22 @@ class ScalarSlotFill(msgspec.Struct, frozen=True):
     cap: Optional[int] = None
 
 
+class RecordedFill(msgspec.Struct, frozen=True):
+    """A ``fill_from``'s device writes held for a later launch (its host copies are
+    made): ``pairs`` (dst, src) and the scalar slot write, as ``fill_slots`` takes them."""
+
+    pairs: List[Tuple[torch.Tensor, torch.Tensor]]
+    scalar: Optional[Tuple[torch.Tensor, torch.Tensor, int, int, int]] = None
+
+    def with_copy(self, dst: torch.Tensor, src: torch.Tensor) -> RecordedFill:
+        return RecordedFill(pairs=[*self.pairs, (dst, src)], scalar=self.scalar)
+
+    def launch(self) -> None:
+        from sglang.kernels.ops.memory.slot_fill import fill_slots
+
+        fill_slots(self.pairs, self.scalar)
+
+
 @dataclass
 class GraphSlot:
     """A single FB-mirrored buffer.
@@ -557,23 +573,52 @@ class CudaGraphBufferRegistry:
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
 
+    def record_fill(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+        raw_num_tokens: int,
+        padded_num_tokens: int,
+        pp_proxy_tensors: Optional[Any] = None,
+        skip_slots: frozenset = frozenset(),
+    ) -> Optional[RecordedFill]:
+        """``fill_from`` with its device writes returned for the caller to launch before
+        any read of the slots; None, with nothing written, for a call whose writes are
+        not one ``fill_slots`` launch."""
+        ctx = FillContext(
+            raw_bs=raw_bs,
+            padded_bs=padded_bs,
+            raw_num_tokens=raw_num_tokens,
+            padded_num_tokens=padded_num_tokens,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        return self._record_fill(forward_batch, ctx, skip_slots)
+
     def _fill_fused(
         self, forward_batch: ForwardBatch, ctx: FillContext, skip_slots: frozenset
     ) -> bool:
         """``fill_from`` with phase 2's device copies and phase 3's hooks in one launch;
         False, with nothing written, for a call that does not qualify."""
-        if torch.cuda.is_current_stream_capturing():
+        recorded = self._record_fill(forward_batch, ctx, skip_slots)
+        if recorded is None:
             return False
+        recorded.launch()
+        return True
+
+    def _record_fill(
+        self, forward_batch: ForwardBatch, ctx: FillContext, skip_slots: frozenset
+    ) -> Optional[RecordedFill]:
+        if torch.cuda.is_current_stream_capturing():
+            return None
         plan = self._plan_fused_fill(forward_batch, ctx, skip_slots)
         if plan is None:
-            return False
-        from sglang.kernels.ops.memory.slot_fill import fill_slots
-
+            return None
         gpu_pairs, cpu_pairs, scalar = plan
-        fill_slots(gpu_pairs, scalar)
         for dst, src in cpu_pairs:
             dst.copy_(src)
-        return True
+        return RecordedFill(pairs=gpu_pairs, scalar=scalar)
 
     def _plan_fused_fill(
         self, forward_batch: ForwardBatch, ctx: FillContext, skip_slots: frozenset

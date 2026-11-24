@@ -1,7 +1,7 @@
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -12,6 +12,7 @@ from sglang.srt.layers.attention import flashattention_backend as flashattention
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.model_executor.cuda_graph_buffer_registry import RecordedFill
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -594,6 +595,140 @@ class TestDraftKVRingReads(CustomTestCase):
                 setattr(b, attr, value)
                 with self.assertRaises(ValueError):
                     b.set_draft_kv_ring(ring)
+
+
+def _verify_fa_backend(*, cls=FlashAttentionBackend, page_size=16, bs=5, gen=None):
+    """A top-k 1 FlashAttention backend on a static pool, with one verify bucket."""
+    device = "cuda" if gen is not None else "cpu"
+    b = cls.__new__(cls)
+    b.max_context_len = 256
+    b.page_size = page_size
+    b.max_num_pages = 256 // page_size
+    b.device = device
+    b.topk = 1
+    b.speculative_num_draft_tokens = 4
+    b.use_mla = False
+    b.is_prefill_aware_swa = False
+    b.has_swa = False
+    b.use_sliding_window_kv_pool = False
+    b.req_to_token = (
+        torch.randint(0, 1 << 20, (12, 256), generator=gen, device=device).int()
+        if gen is not None
+        else torch.zeros((12, 256), dtype=torch.int32)
+    )
+    b.runner_ids = RunnerIds(
+        req_to_token=b.req_to_token,
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+        page_size=page_size,
+        device=device,
+    )
+    metadata = flashattention_module.FlashAttentionMetadata()
+    metadata.cache_seqlens_int32 = torch.full(
+        (bs,), -5, dtype=torch.int32, device=device
+    )
+    metadata.cu_seqlens_k = torch.full((bs + 1,), -5, dtype=torch.int32, device=device)
+    metadata.page_table = torch.full(
+        (bs, b.max_num_pages), -5, dtype=torch.int32, device=device
+    )
+    metadata.swa_page_table = None
+    b.target_verify_metadata = {bs: metadata}
+    return b, metadata
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestHeldReplayInputCopies(CustomTestCase):
+    """SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD: a verify replay prep holding the draft
+    runner's slot copies writes what the copies followed by the stock prep write, in
+    one launch when the metadata can read the copies' sources."""
+
+    BS = 5
+
+    def _replay(self, *, held, converted_lens=False):
+        gen = torch.Generator("cuda").manual_seed(0)
+        b, metadata = _verify_fa_backend(bs=self.BS, gen=gen)
+        lens_dtype = torch.int32 if converted_lens else torch.int64
+        # Stale but in-range slot values: a prep reading a slot before its copy
+        # lands writes other rows' tables, not an illegal address.
+        lens_slot = torch.full((8,), 77, dtype=lens_dtype, device="cuda")
+        rows_slot = torch.full((8,), 11, dtype=torch.int64, device="cuda")
+        ids_slot = torch.full((24,), -1, dtype=torch.int64, device="cuda")
+        seq_lens = torch.randint(0, 250, (self.BS,), generator=gen, device="cuda")
+        rows = torch.randperm(12, generator=gen, device="cuda")[: self.BS]
+        ids = torch.randint(0, 1000, (4 * self.BS,), generator=gen, device="cuda")
+        copies = RecordedFill(
+            pairs=[
+                (ids_slot[: 4 * self.BS], ids),
+                (lens_slot[: self.BS], seq_lens),
+                (rows_slot[: self.BS], rows),
+            ]
+        )
+        if held:
+            b.hold_replay_input_copies(copies)
+        else:
+            copies.launch()
+        b._apply_cuda_graph_metadata(
+            plan=None,
+            bs=self.BS,
+            req_pool_indices=rows_slot,
+            seq_lens=lens_slot,
+            encoder_lens=None,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            spec_info=SimpleNamespace(),
+            seq_lens_cpu=None,
+        )
+        self.assertIsNone(b.take_replay_input_copies())
+        written = (
+            metadata.cache_seqlens_int32,
+            metadata.cu_seqlens_k,
+            metadata.page_table,
+        )
+        return [*written, ids_slot, lens_slot, rows_slot]
+
+    def test_held_copies_ride_the_metadata_launch(self):
+        stock = self._replay(held=False)
+        fails = Mock(side_effect=AssertionError("a launch of its own"))
+        with (
+            patch.object(flashattention_module, "normal_decode_set_metadata", fails),
+            patch("sglang.kernels.ops.memory.slot_fill.fill_slots", fails),
+        ):
+            fused = self._replay(held=True)
+        for want, got in zip(stock, fused):
+            self.assertTrue(torch.equal(want, got))
+
+    def test_copies_the_launch_cannot_take_land_before_the_stock_prep(self):
+        """The metadata reads the converted lengths, so the copies launch first."""
+        stock = self._replay(held=False, converted_lens=True)
+        held = self._replay(held=True, converted_lens=True)
+        for want, got in zip(stock, held):
+            self.assertTrue(torch.equal(want, got))
+
+
+class TestReplayInputCopiesBlocker(CustomTestCase):
+    """The draft runner holds its slot copies only for a prep whose first read of
+    them is the plain metadata launch; each other prep reads a slot before it."""
+
+    def test_only_the_plain_verify_prep_takes_copies(self):
+        class Subclass(FlashAttentionBackend):
+            pass
+
+        self.assertEqual(_verify_fa_backend()[0].replay_input_copies_blocker(), "")
+        changes = {
+            "subclass": lambda b: None,
+            "top-k": lambda b: setattr(b, "topk", 2),
+            "sliding window": lambda b: setattr(b, "use_sliding_window_kv_pool", True),
+            "translated": lambda b: setattr(
+                b, "runner_ids", SimpleNamespace(reads_are_translated=True)
+            ),
+            "ring": lambda b: setattr(b, "_draft_kv_ring", object()),
+        }
+        for name, change in changes.items():
+            with self.subTest(change=name):
+                b, _ = _verify_fa_backend(
+                    cls=Subclass if name == "subclass" else FlashAttentionBackend
+                )
+                change(b)
+                self.assertTrue(b.replay_input_copies_blocker())
 
 
 if __name__ == "__main__":

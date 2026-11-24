@@ -167,10 +167,47 @@ def _sharded_verify_logits_processor(model) -> Optional[LogitsProcessor]:
     return processors[0] if len(processors) == 1 else None
 
 
+def _copy_as_words(
+    dst: torch.Tensor, src: torch.Tensor
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """``dst.copy_(src)`` of two contiguous tensors of one layout as (dst, src) views of
+    64-bit words, which an integer slot copy moves unchanged; None when the copy has no
+    such form (layout, 8-byte alignment, overlap)."""
+    if (
+        dst.shape != src.shape
+        or dst.dtype != src.dtype
+        or dst.device != src.device
+        or not dst.is_contiguous()
+        or not src.is_contiguous()
+    ):
+        return None
+    nbytes = dst.numel() * dst.element_size()
+    if (
+        nbytes == 0
+        or nbytes % 8
+        or any(
+            t.data_ptr() % 8 or t.storage_offset() * t.element_size() % 8
+            for t in (dst, src)
+        )
+    ):
+        return None
+    if (
+        dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr()
+        and dst.data_ptr() < src.data_ptr() + nbytes
+        and src.data_ptr() < dst.data_ptr() + nbytes
+    ):
+        return None
+    words = (t.reshape(-1).view(torch.uint8).view(torch.int64) for t in (dst, src))
+    return tuple(words)
+
+
 # Draft metadata glue: steps between two "draft glue" tally lines per rank
 DRAFT_GLUE_LOG_EVERY = 1000
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.flashattention_backend import (
+        FlashAttentionBackend,
+    )
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -297,6 +334,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # Set in __init__: which DSpark runner's prep the glue graph serves past the guard.
     _draft_metadata_glue = False
     _target_metadata_glue = False
+    # Set in __init__: the backend whose verify metadata launch writes this DFLASH draft
+    # runner's slot copies (SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD).
+    _draft_load_metadata_backend: Optional[FlashAttentionBackend] = None
     _padded_glue = False
     _metadata_prep_fork: Optional[tuple] = None
     # Set in __init__: a speculative verify's checkpoint ids for its replay prep.
@@ -687,6 +727,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 "for variants %s.",
                 sorted(DSV41_EARLY_VERIFY_VARIANTS),
             )
+        self._draft_load_metadata_backend = self._resolve_draft_load_metadata_backend()
 
         # --- capture --------------------------------------------------
         try:
@@ -1746,15 +1787,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         early_staged = self._take_early_verify_metadata(
             forward_batch, raw_bs=raw_bs, bs=bs, is_ragged=is_ragged, key=glue_key
         )
-        self.buffer_registry.fill_from(
+        holds_inputs = not early_staged and self._hold_draft_load_inputs(
             forward_batch,
             raw_bs=raw_bs,
             padded_bs=bs,
-            raw_num_tokens=raw_num_token,
+            raw_num_token=raw_num_token,
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
-            skip_slots=STAGED_SLOTS if early_staged else frozenset(),
         )
+        if not holds_inputs:
+            self.buffer_registry.fill_from(
+                forward_batch,
+                raw_bs=raw_bs,
+                padded_bs=bs,
+                raw_num_tokens=raw_num_token,
+                padded_num_tokens=padded_num_tokens,
+                pp_proxy_tensors=pp_proxy_tensors,
+                skip_slots=STAGED_SLOTS if early_staged else frozenset(),
+            )
         if self._restage_skip and not early_staged:
             self._staged_inputs = self._staged_signature(forward_batch)
         if self._skips_prefilled_inputs:
@@ -1762,6 +1812,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         if (
             not is_ragged
+            and not holds_inputs
             and (
                 self.dllm_uses_input_embeds
                 or (
@@ -1790,15 +1841,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Idle replay uses the same mask mode as capture.
             forward_batch.spec_info.custom_mask = self._capture_custom_mask
 
-        self._init_replay_attn_metadata(
-            forward_batch,
-            raw_bs=raw_bs,
-            bs=bs,
-            num_tokens=padded_num_tokens,
-            glue_key=glue_key,
-            early_staged=early_staged,
-            attention_variant=attention_variant,
-        )
+        try:
+            self._init_replay_attn_metadata(
+                forward_batch,
+                raw_bs=raw_bs,
+                bs=bs,
+                num_tokens=padded_num_tokens,
+                glue_key=glue_key,
+                early_staged=early_staged,
+                attention_variant=attention_variant,
+            )
+        finally:
+            if holds_inputs:
+                self._flush_draft_load_inputs()
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._maybe_log_draft_glue()
 
@@ -1825,6 +1880,93 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ),
             ),
         )
+
+    def _resolve_draft_load_metadata_backend(self) -> Optional[FlashAttentionBackend]:
+        """This DFLASH draft runner's FlashAttention backend, when its verify metadata
+        launch can also write the runner's slot copies: between the fill and that
+        launch no glue graph, two-batch overlap, LoRA, encoder or diffusion input
+        prep, or DP pad-row count reads or writes the slots."""
+        if not (
+            envs.SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD.get()
+            and is_cuda()
+            and self.model_runner.spec_algorithm.is_dflash_family()
+            and self.model_runner.is_draft_worker
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not self.ragged_verify_mode
+            and not self.dllm_uses_input_embeds
+            and self.dllm_input_preparation is None
+            and not self.enable_two_batch_overlap
+            and not self.is_encoder_decoder
+            and self._metadata_glue is None
+            and self.model_runner.lora_manager is None
+            and not _dp_tp_moe_masks_pad_rows()
+        ):
+            return None
+        from sglang.srt.layers.attention.flashattention_backend import (
+            FlashAttentionBackend,
+        )
+
+        backend = self.attn_backend
+        why = (
+            backend.replay_input_copies_blocker()
+            if isinstance(backend, FlashAttentionBackend)
+            else "not the FlashAttention backend"
+        )
+        if why:
+            logger.info("DFLASH draft loads keep their own launches: %s.", why)
+            return None
+        logger.info(
+            "DFLASH draft loads write their inputs in the verify metadata launch."
+        )
+        return backend
+
+    def _hold_draft_load_inputs(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        raw_bs: int,
+        padded_bs: int,
+        raw_num_token: int,
+        padded_num_tokens: int,
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> bool:
+        """Record this draft load's slot copies, with its input_embeds copy as 64-bit
+        words, and hold them for the backend's verify metadata launch; False, with
+        nothing written, for a load whose writes are not one launch."""
+        backend = self._draft_load_metadata_backend
+        if (
+            backend is None
+            or not forward_batch.forward_mode.is_target_verify()
+            or forward_batch.ragged_verify_layout is not None
+        ):
+            return False
+        embeds_words = None
+        if forward_batch.input_embeds is not None:
+            embeds_words = _copy_as_words(
+                self.buffers.input_embeds[:raw_num_token], forward_batch.input_embeds
+            )
+            if embeds_words is None:
+                return False
+        recorded = self.buffer_registry.record_fill(
+            forward_batch,
+            raw_bs=raw_bs,
+            padded_bs=padded_bs,
+            raw_num_tokens=raw_num_token,
+            padded_num_tokens=padded_num_tokens,
+            pp_proxy_tensors=pp_proxy_tensors,
+        )
+        if recorded is None:
+            return False
+        if embeds_words is not None:
+            recorded = recorded.with_copy(*embeds_words)
+        backend.hold_replay_input_copies(recorded)
+        return True
+
+    def _flush_draft_load_inputs(self) -> None:
+        """Launch the held slot copies the backend's metadata prep did not take."""
+        leftover = self._draft_load_metadata_backend.take_replay_input_copies()
+        if leftover is not None:
+            leftover.launch()
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
         input_ids, positions = forward_batch.input_ids, forward_batch.positions
