@@ -3342,6 +3342,7 @@ class FlashAttentionBackend(AttentionBackend):
                     seq_lens=seq_lens,
                     seq_len_delta=seq_len_delta,
                     page_size=self.page_size,
+                    stage=copies.stage,
                 )
             ):
                 return

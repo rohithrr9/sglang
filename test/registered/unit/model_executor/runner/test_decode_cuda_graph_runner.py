@@ -32,6 +32,7 @@ from unittest import mock
 import torch
 
 from sglang.kernels.ops.memory import slot_fill
+from sglang.kernels.ops.speculative import dflash as dflash_ops
 from sglang.srt.model_executor.cuda_graph_buffer_registry import RecordedFill
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
@@ -721,6 +722,21 @@ def _fill_slots_on_host(pairs, slot=None):
         dst.copy_(src if mode == 1 else (src - offset).clamp(0, cap))
 
 
+def _stage_on_host(temps, top_ks, temps_out, greedy_out, lo):
+    temps_out.copy_(torch.where(temps < lo, torch.full_like(temps, lo), temps))
+    greedy_out.copy_(top_ks <= 1)
+
+
+def _staging():
+    return (
+        torch.tensor([0.5, 1e-6]),
+        torch.tensor([1, 3], dtype=torch.int32),
+        torch.full((2,), -1.0),
+        torch.zeros(2, dtype=torch.bool),
+        1e-5,
+    )
+
+
 class _HoldingBackend:
     """The FlashAttention backend's side of a held draft load."""
 
@@ -750,9 +766,12 @@ class _RecordingRegistry:
 class TestDraftLoadHeldForMetadata(CustomTestCase):
     """SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD: a held DFLASH draft load writes its slots
     and input_embeds only through the copies it hands the attention backend, and what
-    the backend's prep leaves is launched before the load returns."""
+    the backend's prep leaves is launched before the load returns. With
+    SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD a held sampler staging rides along."""
 
-    def _load(self, *, prep="take", holds=True, records=True, **batch_fields):
+    def _load(
+        self, *, prep="take", holds=True, records=True, stage=None, **batch_fields
+    ):
         ids_slot = torch.full((8,), -1)
         fb = SimpleNamespace(
             needs_forward_metadata_init=lambda: True,
@@ -786,6 +805,7 @@ class TestDraftLoadHeldForMetadata(CustomTestCase):
         runner.buffers = SimpleNamespace(input_embeds=torch.full((8, 4), 7.0))
         runner.buffer_registry = registry
         runner._draft_load_metadata_backend = backend if holds else None
+        runner._takes_sampler_stage = holds
         for name, stub in dict(
             _validate_capture_hidden_mode=lambda fb: None,
             _capture_graph_size=lambda **_: 2,
@@ -808,17 +828,29 @@ class TestDraftLoadHeldForMetadata(CustomTestCase):
                 backend.taken.append(backend.take_replay_input_copies())
 
         runner._init_replay_attn_metadata = init_replay_attn_metadata
-        launches = []
+        launches, stages = [], []
 
         def fill_slots(pairs, slot=None):
             launches.append(list(pairs))
             _fill_slots_on_host(pairs, slot)
 
-        with mock.patch.object(slot_fill, "fill_slots", fill_slots):
+        def stage_sampling_params(*staging):
+            stages.append(staging)
+            _stage_on_host(*staging)
+
+        with (
+            mock.patch.object(slot_fill, "fill_slots", fill_slots),
+            mock.patch.object(
+                dflash_ops, "stage_sampling_params", stage_sampling_params
+            ),
+        ):
+            if stage is not None:
+                self.assertEqual(runner.hold_sampler_stage(stage), holds)
             try:
                 runner.load_batch(fb)
             except RuntimeError:
                 self.assertEqual(prep, "raise")
+        self.assertIsNone(runner._held_sampler_stage)
         return SimpleNamespace(
             fb=fb,
             ids_slot=ids_slot,
@@ -826,6 +858,7 @@ class TestDraftLoadHeldForMetadata(CustomTestCase):
             registry=registry,
             backend=backend,
             launches=launches,
+            stages=stages,
         )
 
     def test_held_load_writes_only_through_the_copies_it_hands_over(self):
@@ -862,6 +895,47 @@ class TestDraftLoadHeldForMetadata(CustomTestCase):
                 self.assertEqual(load.registry.calls, calls)
                 self.assertEqual((load.launches, load.backend.held), ([], None))
                 self.assertTrue(torch.equal(load.embeds, load.fb.input_embeds))
+
+    def test_held_staging_rides_the_load_or_launches_by_its_end(self):
+        staging = _staging()
+        load = self._load(stage=staging)
+        [taken] = load.backend.taken
+        self.assertIs(taken.stage, staging)
+        self.assertEqual(load.stages, [])
+        # The backend took the load but launched nothing: the staging is unwritten.
+        self.assertTrue(torch.all(staging[2] == -1.0))
+        for name, kwargs in {
+            "prep leaves the load": dict(prep="leave"),
+            "prep raises": dict(prep="raise"),
+            "load not held": dict(ragged_verify_layout=object()),
+        }.items():
+            with self.subTest(name):
+                staging = _staging()
+                load = self._load(stage=staging, **kwargs)
+                self.assertEqual(len(load.stages), 1)
+                self.assertTrue(torch.equal(staging[2], torch.tensor([0.5, 1e-5])))
+                self.assertEqual(staging[3].tolist(), [True, False])
+
+    def test_a_held_staging_launches_before_the_next_one(self):
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        first, second = _staging(), _staging()
+        stages = []
+
+        def launch(*staging):
+            stages.append(staging)
+
+        with mock.patch.object(dflash_ops, "stage_sampling_params", launch):
+            self.assertFalse(runner.hold_sampler_stage(first))
+            runner._takes_sampler_stage = True
+            self.assertTrue(runner.hold_sampler_stage(first))
+            self.assertEqual(stages, [])
+            self.assertTrue(runner.hold_sampler_stage(second))
+            self.assertEqual(len(stages), 1)
+            self.assertIs(stages[0][2], first[2])
+            runner.flush_sampler_stage()
+            runner.flush_sampler_stage()
+        self.assertEqual(len(stages), 2)
+        self.assertIs(stages[1][2], second[2])
 
     def test_word_views_copy_the_same_bytes(self):
         for dtype, shape in (

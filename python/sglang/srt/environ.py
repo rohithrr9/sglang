@@ -1944,6 +1944,11 @@ class Envs:
     SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # The draft sampler's parameter staging joins that one-launch draft load
+    # (SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD) instead of launching on its own.
+    SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

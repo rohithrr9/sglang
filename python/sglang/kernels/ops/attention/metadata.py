@@ -669,6 +669,9 @@ _FILL_BLOCK = 1024
         "slot_cap",
         "B",
         "max_seq_pages",
+        "t_stride",
+        "k_stride",
+        "stage_bs",
     ],
     do_not_specialize_on_alignment=["sizes", "strides", "slot_off", "slot_cap"],
 )
@@ -703,10 +706,22 @@ def _fill_slots_decode_metadata_kernel(
     PAGE_SIZE: tl.constexpr,
     SEQ_LEN_DELTA: tl.constexpr,
     BLOCK_COLS: tl.constexpr,
+    t_src,
+    t_stride,
+    t_dst,
+    k_src,
+    k_stride,
+    g_dst,
+    lo,
+    stage_bs,
+    SIDX: tl.constexpr,
+    STAGE: tl.constexpr,
+    SBLOCK: tl.constexpr,
 ):
     """Programs (b, c) with b < B: the decode metadata kernel's work for row b, page columns [c * BLOCK_COLS, ...);
     program (0, 0) also writes the lengths and their prefix sum. Programs (B + f, c): copy f < NF moves elements
-    [c * FB, (c + 1) * FB) of srcs[f] to dsts[f] as _fill_kernel does; program (B + NF, 0) writes the slot."""
+    [c * FB, (c + 1) * FB) of srcs[f] to dsts[f] as _fill_kernel does; program (B + NF, 0) writes the slot; with STAGE,
+    program (B + SIDX, 0) writes the sampler staging as _stage_kernel does."""
     pid_b = tl.program_id(0)
     pid_c = tl.program_id(1)
     if pid_b >= B:
@@ -725,6 +740,15 @@ def _fill_slots_decode_metadata_kernel(
                         g = g - slot_off
                         g = tl.minimum(tl.maximum(g, 0), slot_cap)
                     tl.store(slot_dst, g)
+        if STAGE:
+            if f == SIDX:
+                if pid_c == 0:
+                    j = tl.arange(0, SBLOCK)
+                    sm = j < stage_bs
+                    x = tl.load(t_src + j * t_stride, mask=sm)
+                    tl.store(t_dst + j, tl.where(x < lo, lo, x), mask=sm)
+                    kk = tl.load(k_src + j * k_stride, mask=sm)
+                    tl.store(g_dst + j, kk <= 1, mask=sm)
         return
 
     # The decode metadata kernel's body (lengths, prefix sum, page table of the live columns).
@@ -767,6 +791,10 @@ def _fill_slots_decode_metadata_kernel(
 
 # (storage, first byte, end byte) of a tensor with non-negative strides.
 _ByteExtent = Tuple[int, int, int]
+
+# (temperatures, top_ks, temperatures out, greedy mask out, lower bound), as
+# stage_sampling_params takes them.
+SamplerStageWrite = Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float]
 
 
 def _byte_extent(t: torch.Tensor) -> _ByteExtent:
@@ -824,14 +852,17 @@ def fill_slots_then_decode_metadata(
     seq_lens: torch.Tensor,
     seq_len_delta: int,
     page_size: int,
+    stage: Optional[SamplerStageWrite] = None,
 ) -> bool:
     """``fill_slots(pairs, slot)`` (``sglang.kernels.ops.memory.slot_fill``), then
     ``normal_decode_set_metadata`` without sliding-window table, page mapping or tail
-    zeroing, in one launch with the same bytes written.
+    zeroing, and ``stage_sampling_params(*stage)``
+    (``sglang.kernels.ops.speculative.dflash``) in one launch with the same bytes
+    written.
 
     An input of the metadata that is exactly a copy's destination is read from that
-    copy's source. False, with nothing launched, when the two cannot share a launch:
-    no copy, an input partly written by a copy, outputs overlapping any other operand,
+    copy's source. False, with nothing launched, when they cannot share a launch: no
+    copy, an input partly written by a copy, a write overlapping any other operand,
     or layouts the metadata kernel does not take.
     """
     if not pairs or max_seq_pages <= 0 or page_size <= 0 or page_size & (page_size - 1):
@@ -883,6 +914,19 @@ def fill_slots_then_decode_metadata(
             return False
     if any(_overlap(table, w) for w in written):
         return False
+    if stage is not None:
+        stage_in = [_byte_extent(t) for t in stage[:2]]
+        stage_out = [_byte_extent(t) for t in stage[2:4]]
+        if (
+            _overlap(*stage_out)
+            or any(
+                _overlap(x, y)
+                for x in stage_out
+                for y in written + read + outputs + stage_in
+            )
+            or any(_overlap(x, y) for x in stage_in for y in written + outputs)
+        ):
+            return False
 
     dsts = tuple(d for d, _ in pairs)
     srcs = tuple(s for _, s in pairs)
@@ -891,10 +935,41 @@ def fill_slots_then_decode_metadata(
     mode, s_dst, s_src, off, cap = 0, dsts[0], dsts[0], 0, 0
     if slot is not None:
         s_dst, s_src, mode, off, cap = slot
+    sidx = len(pairs) + (1 if mode else 0)
+    if stage is not None:
+        t, k, td, gd, lo = stage
+        sbs = int(td.shape[0])
+        st = dict(
+            t_src=t,
+            t_stride=int(t.stride(0)),
+            t_dst=td,
+            k_src=k,
+            k_stride=int(k.stride(0)),
+            g_dst=gd,
+            lo=float(lo),
+            stage_bs=sbs,
+            SIDX=sidx,
+            STAGE=1,
+            SBLOCK=triton.next_power_of_2(max(sbs, 16)),
+        )
+    else:
+        st = dict(
+            t_src=dsts[0],
+            t_stride=1,
+            t_dst=dsts[0],
+            k_src=dsts[0],
+            k_stride=1,
+            g_dst=dsts[0],
+            lo=0.0,
+            stage_bs=0,
+            SIDX=sidx,
+            STAGE=0,
+            SBLOCK=16,
+        )
     # The stock launcher's column block for this form.
     block_cols = 256 if page_size == 1 else 128
     grid = (
-        b + len(pairs) + (1 if mode else 0),
+        b + sidx + (1 if stage is not None else 0),
         max(
             triton.cdiv(max_seq_pages, block_cols), triton.cdiv(max(sizes), _FILL_BLOCK)
         ),
@@ -932,6 +1007,7 @@ def fill_slots_then_decode_metadata(
         BLOCK_COLS=block_cols,
         num_warps=block_cols // 32,
         num_stages=3,
+        **st,
     )
     return True
 

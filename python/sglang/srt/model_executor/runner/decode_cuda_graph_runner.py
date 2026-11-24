@@ -205,6 +205,7 @@ def _copy_as_words(
 DRAFT_GLUE_LOG_EVERY = 1000
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.attention.metadata import SamplerStageWrite
     from sglang.srt.layers.attention.flashattention_backend import (
         FlashAttentionBackend,
     )
@@ -337,6 +338,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     # Set in __init__: the backend whose verify metadata launch writes this DFLASH draft
     # runner's slot copies (SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD).
     _draft_load_metadata_backend: Optional[FlashAttentionBackend] = None
+    # Set in __init__: the draft sampler's staging may join that launch
+    # (SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD); the staging held until a load.
+    _takes_sampler_stage = False
+    _held_sampler_stage: Optional[SamplerStageWrite] = None
     _padded_glue = False
     _metadata_prep_fork: Optional[tuple] = None
     # Set in __init__: a speculative verify's checkpoint ids for its replay prep.
@@ -728,6 +733,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 sorted(DSV41_EARLY_VERIFY_VARIANTS),
             )
         self._draft_load_metadata_backend = self._resolve_draft_load_metadata_backend()
+        self._takes_sampler_stage = (
+            self._draft_load_metadata_backend is not None
+            and envs.SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD.get()
+        )
 
         # --- capture --------------------------------------------------
         try:
@@ -1854,6 +1863,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         finally:
             if holds_inputs:
                 self._flush_draft_load_inputs()
+            self.flush_sampler_stage()
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._maybe_log_draft_glue()
 
@@ -1959,6 +1969,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return False
         if embeds_words is not None:
             recorded = recorded.with_copy(*embeds_words)
+        stage, self._held_sampler_stage = self._held_sampler_stage, None
+        if stage is not None:
+            recorded = recorded.with_stage(stage)
         backend.hold_replay_input_copies(recorded)
         return True
 
@@ -1967,6 +1980,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         leftover = self._draft_load_metadata_backend.take_replay_input_copies()
         if leftover is not None:
             leftover.launch()
+
+    def hold_sampler_stage(self, stage: SamplerStageWrite) -> bool:
+        """Hold the draft sampler's staging for this runner's next load to write in its
+        one launch; False, with nothing held, when this runner's loads launch their own
+        writes. Only the draft graph, which replays after that load, reads the staging."""
+        if not self._takes_sampler_stage:
+            return False
+        self.flush_sampler_stage()
+        self._held_sampler_stage = stage
+        return True
+
+    def flush_sampler_stage(self) -> None:
+        """Launch a held staging no load wrote."""
+        stage, self._held_sampler_stage = self._held_sampler_stage, None
+        if stage is not None:
+            from sglang.kernels.ops.speculative.dflash import stage_sampling_params
+
+            stage_sampling_params(*stage)
 
     def _staged_signature(self, forward_batch: ForwardBatch) -> Optional[tuple]:
         input_ids, positions = forward_batch.input_ids, forward_batch.positions

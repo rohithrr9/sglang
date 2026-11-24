@@ -40,6 +40,7 @@ from sglang.srt.model_executor.input_buffers import (
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
+    from sglang.kernels.ops.attention.metadata import SamplerStageWrite
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 
@@ -173,18 +174,27 @@ class ScalarSlotFill(msgspec.Struct, frozen=True):
 
 class RecordedFill(msgspec.Struct, frozen=True):
     """A ``fill_from``'s device writes held for a later launch (its host copies are
-    made): ``pairs`` (dst, src) and the scalar slot write, as ``fill_slots`` takes them."""
+    made): ``pairs`` (dst, src) and the scalar slot write, as ``fill_slots`` takes them,
+    and a draft sampler's staging that joins them."""
 
     pairs: List[Tuple[torch.Tensor, torch.Tensor]]
     scalar: Optional[Tuple[torch.Tensor, torch.Tensor, int, int, int]] = None
+    stage: Optional[SamplerStageWrite] = None
 
     def with_copy(self, dst: torch.Tensor, src: torch.Tensor) -> RecordedFill:
-        return RecordedFill(pairs=[*self.pairs, (dst, src)], scalar=self.scalar)
+        return msgspec.structs.replace(self, pairs=[*self.pairs, (dst, src)])
+
+    def with_stage(self, stage: SamplerStageWrite) -> RecordedFill:
+        return msgspec.structs.replace(self, stage=stage)
 
     def launch(self) -> None:
         from sglang.kernels.ops.memory.slot_fill import fill_slots
 
         fill_slots(self.pairs, self.scalar)
+        if self.stage is not None:
+            from sglang.kernels.ops.speculative.dflash import stage_sampling_params
+
+            stage_sampling_params(*self.stage)
 
 
 @dataclass

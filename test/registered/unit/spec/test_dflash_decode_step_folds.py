@@ -7,6 +7,7 @@ from unittest import mock
 
 import torch
 
+from sglang.kernels.ops.speculative import dflash as dflash_ops
 from sglang.srt.environ import envs
 from sglang.srt.layers.muse_spark.muse_spark_layers import MuseSpark1xRMSNorm
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -16,9 +17,15 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.overlap_utils import FutureMap, FutureRelayBuffers
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.models.muse_spark_omni import _NormalizedEmbedding
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+from sglang.srt.speculative.dflash_worker_v2 import (
+    DFlashWorkerV2,
+    _SelectorDraftSampler,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
@@ -68,6 +75,79 @@ class TestDraftTokensAlias(CustomTestCase):
                 self.assertTrue(torch.equal(blocks[True], blocks[False]))
                 self.assertTrue(torch.equal(blocks[True][:, 0], bonus))
                 self.assertTrue(torch.equal(blocks[True][:, 1:], draft_next))
+
+
+class TestSamplerStageInDraftLoad(CustomTestCase):
+    """SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD: the worker hands the selector
+    sampler's staging to the draft graph runner and writes nothing itself, only in the
+    one-launch form and to a runner whose loads take it; any other staging is stock."""
+
+    def _step(self, *, armed=True, runner="takes", top_ks_dtype=torch.int32, info=True):
+        sampler = _SelectorDraftSampler.__new__(_SelectorDraftSampler)
+        sampler.sampling_enabled, sampler.max_bs = True, 4
+        sampler._stage_in_one_launch = False
+        sampler.temperatures = torch.full((4,), -2.0)
+        sampler.greedy_mask = torch.zeros(4, dtype=torch.bool)
+        graph_runner = None
+        if runner in ("takes", "launches its own"):
+            graph_runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+            graph_runner._takes_sampler_stage = runner == "takes"
+        elif runner == "eager":
+            graph_runner = SimpleNamespace()
+        worker = _bind(
+            SimpleNamespace(
+                _draft_sampler=sampler,
+                _sampler_stage_in_draft_load=armed,
+                draft_model_runner=SimpleNamespace(
+                    decode_cuda_graph_runner=graph_runner
+                ),
+            ),
+            "_stage_draft_sampler",
+            "_hold_sampler_stage",
+            "_flush_sampler_stage",
+        )
+        sampling_info = SimpleNamespace(
+            temperatures=torch.tensor([[0.0], [0.7], [float("nan")]]),
+            top_ks=torch.tensor([1, 5, 0], dtype=top_ks_dtype),
+        )
+        worker._stage_draft_sampler(bs=3, sampling_info=sampling_info if info else None)
+        return worker, sampler, graph_runner
+
+    def test_held_staging_writes_only_when_launched(self):
+        launches = []
+
+        def launch(temps, top_ks, temps_out, greedy_out, lo):
+            launches.append(temps_out)
+            temps_out.copy_(torch.clamp(temps, min=lo))
+            greedy_out.copy_(top_ks <= 1)
+
+        with mock.patch.object(dflash_ops, "stage_sampling_params", launch):
+            worker, sampler, graph_runner = self._step()
+            self.assertIsNotNone(graph_runner._held_sampler_stage)
+            self.assertTrue(torch.all(sampler.temperatures == -2.0))
+            worker._flush_sampler_stage()
+        self.assertIsNone(graph_runner._held_sampler_stage)
+        self.assertEqual(len(launches), 1)
+        _, stock, _ = self._step(armed=False)
+        self.assertTrue(torch.equal(sampler.temperatures[:2], stock.temperatures[:2]))
+        self.assertTrue(sampler.temperatures[2].isnan())
+        self.assertTrue(torch.equal(sampler.greedy_mask, stock.greedy_mask))
+
+    def test_other_stagings_run_stock(self):
+        misses = {
+            "knob off": dict(armed=False),
+            "eager draft runner": dict(runner="eager"),
+            "no draft graph": dict(runner=None),
+            "runner launches its own": dict(runner="launches its own"),
+            "int64 top_ks": dict(top_ks_dtype=torch.int64),
+            "no sampling info": dict(info=False),
+        }
+        for name, kwargs in misses.items():
+            with self.subTest(miss=name):
+                _, sampler, graph_runner = self._step(**kwargs)
+                self.assertFalse(torch.all(sampler.temperatures == -2.0))
+                if isinstance(graph_runner, DecodeCudaGraphRunner):
+                    self.assertIsNone(graph_runner._held_sampler_stage)
 
 
 class TestFusedAcceptTailGate(CustomTestCase):

@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.metadata import SamplerStageWrite
 from sglang.kernels.ops.communication import dflash_commit as dflash_commit_op
 from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.kernels.ops.speculative.cache_locs import (
@@ -65,6 +66,9 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
@@ -476,8 +480,20 @@ class _SelectorDraftSampler:
         )
 
     def _stage_one_launch(self, *, bs: int, sampling_info) -> bool:
-        """False, with nothing written, unless the batch's params have the layout the
-        kernel reads; the result is bit-identical to the three-op path."""
+        stage = self.one_launch_stage(bs=bs, sampling_info=sampling_info)
+        if stage is None:
+            return False
+        stage_sampling_params(*stage)
+        return True
+
+    def one_launch_stage(
+        self, *, bs: int, sampling_info
+    ) -> Optional[SamplerStageWrite]:
+        """The staging as ``stage_sampling_params`` arguments, bit-identical to the
+        three-op path; None unless the batch samples with params of the layout the
+        kernel reads."""
+        if sampling_info is None or not self.sampling_enabled:
+            return None
         temperatures = sampling_info.temperatures.view(-1)[:bs]
         top_ks = sampling_info.top_ks.view(-1)
         if (
@@ -488,15 +504,14 @@ class _SelectorDraftSampler:
             or temperatures.device != self.temperatures.device
             or top_ks.device != self.temperatures.device
         ):
-            return False
-        stage_sampling_params(
+            return None
+        return (
             temperatures,
             top_ks,
             self.temperatures[:bs],
             self.greedy_mask[:bs],
-            lo=_SELECTOR_MIN_TEMPERATURE,
+            _SELECTOR_MIN_TEMPERATURE,
         )
-        return True
 
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
@@ -688,6 +703,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_worker.model_runner.model_config.hf_config.architectures,
         )
         self._draft_sampler = None
+        self._sampler_stage_in_draft_load = False
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
@@ -1217,6 +1233,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                     self.draft_model_runner.capture_tail_hooks.append(
                         make_draft_sampler_capture_hook(self._draft_sampler)
                     )
+                self._sampler_stage_in_draft_load = (
+                    envs.SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD.get()
+                    and isinstance(self._draft_sampler, _SelectorDraftSampler)
+                )
                 if is_cuda() and envs.SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH.get():
                     self._install_draft_l2_prefetch()
             self._draft_worker.init_cuda_graphs(
@@ -1373,7 +1393,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         if sampler is None:
             return
         if sampler.max_bs is None or bs <= sampler.max_bs:
-            sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+            if not self._hold_sampler_stage(bs=bs, sampling_info=sampling_info):
+                sampler.stage_sampling_params(bs=bs, sampling_info=sampling_info)
+
+    def _hold_sampler_stage(self, *, bs: int, sampling_info) -> bool:
+        """Hand the staging to the draft graph runner, whose next load writes it in its
+        one launch (SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD); False, with nothing
+        written, when the staging or the runner has no such form."""
+        if not self._sampler_stage_in_draft_load:
+            return False
+        runner = self.draft_model_runner.decode_cuda_graph_runner
+        if not isinstance(runner, DecodeCudaGraphRunner):
+            return False
+        stage = self._draft_sampler.one_launch_stage(bs=bs, sampling_info=sampling_info)
+        return stage is not None and runner.hold_sampler_stage(stage)
+
+    def _flush_sampler_stage(self) -> None:
+        """Launch a held staging the draft forward ran no graph load for."""
+        runner = self.draft_model_runner.decode_cuda_graph_runner
+        if isinstance(runner, DecodeCudaGraphRunner):
+            runner.flush_sampler_stage()
 
     def _maybe_build_draft_sampler(self):
         def _eager(reason):
@@ -3798,6 +3837,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_parallel_layout),
         ):
             draft_out = self.draft_model_runner.forward(forward_batch)
+        if self._sampler_stage_in_draft_load:
+            self._flush_sampler_stage()
         draft_logits_output = draft_out.logits_output
 
         if (

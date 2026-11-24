@@ -639,8 +639,9 @@ def _verify_fa_backend(*, cls=FlashAttentionBackend, page_size=16, bs=5, gen=Non
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
 class TestHeldReplayInputCopies(CustomTestCase):
     """SGLANG_OPT_DFLASH_ONE_LAUNCH_DRAFT_LOAD: a verify replay prep holding the draft
-    runner's slot copies writes what the copies followed by the stock prep write, in
-    one launch when the metadata can read the copies' sources."""
+    runner's slot copies (and with SGLANG_OPT_DFLASH_SAMPLER_STAGE_IN_DRAFT_LOAD the
+    sampler's staging) writes what they followed by the stock prep write, in one
+    launch when the metadata can read the copies' sources."""
 
     BS = 5
 
@@ -656,12 +657,17 @@ class TestHeldReplayInputCopies(CustomTestCase):
         seq_lens = torch.randint(0, 250, (self.BS,), generator=gen, device="cuda")
         rows = torch.randperm(12, generator=gen, device="cuda")[: self.BS]
         ids = torch.randint(0, 1000, (4 * self.BS,), generator=gen, device="cuda")
+        temps = torch.tensor([0.0, 0.5, float("nan"), 1e-6, 2.0], device="cuda")
+        top_ks = torch.tensor([1, 4, 0, 2, 1], dtype=torch.int32, device="cuda")
+        temps_out = torch.full((8,), -3.0, device="cuda")
+        greedy_out = torch.zeros((8,), dtype=torch.bool, device="cuda")
         copies = RecordedFill(
             pairs=[
                 (ids_slot[: 4 * self.BS], ids),
                 (lens_slot[: self.BS], seq_lens),
                 (rows_slot[: self.BS], rows),
-            ]
+            ],
+            stage=(temps, top_ks, temps_out[: self.BS], greedy_out[: self.BS], 1e-5),
         )
         if held:
             b.hold_replay_input_copies(copies)
@@ -683,7 +689,15 @@ class TestHeldReplayInputCopies(CustomTestCase):
             metadata.cu_seqlens_k,
             metadata.page_table,
         )
-        return [*written, ids_slot, lens_slot, rows_slot]
+        # Bytes as integers: the staged temperatures keep a NaN.
+        return [
+            *written,
+            ids_slot,
+            lens_slot,
+            rows_slot,
+            temps_out.view(torch.int32),
+            greedy_out,
+        ]
 
     def test_held_copies_ride_the_metadata_launch(self):
         stock = self._replay(held=False)
@@ -691,6 +705,7 @@ class TestHeldReplayInputCopies(CustomTestCase):
         with (
             patch.object(flashattention_module, "normal_decode_set_metadata", fails),
             patch("sglang.kernels.ops.memory.slot_fill.fill_slots", fails),
+            patch("sglang.kernels.ops.speculative.dflash.stage_sampling_params", fails),
         ):
             fused = self._replay(held=True)
         for want, got in zip(stock, fused):

@@ -10,12 +10,18 @@ from sglang.kernels.ops.attention.metadata import (
     normal_decode_set_metadata,
 )
 from sglang.kernels.ops.memory.slot_fill import fill_slots
+from sglang.kernels.ops.speculative.dflash import stage_sampling_params
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 POISON = -0x3C3C3C3C
+
+
+def _bits(t):
+    """The tensor's bytes as integers, so NaN and -0.0 compare exactly."""
+    return t.view(torch.int32) if t.dtype == torch.float32 else t
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
@@ -142,12 +148,13 @@ class TestDecodeMetadataMapping(CustomTestCase):
 
 class _DraftLoad:
     """A DFLASH draft load: the slot copies (``pairs``, ``slot``) and the verify
-    metadata, which reads its lengths and request rows from two of the slots."""
+    metadata, which reads its lengths and request rows from two of the slots, and the
+    draft sampler's staging (``stage``)."""
 
     DELTA, WIDTH = 16, 40
 
     def __init__(
-        self, gen, *, bs, ps, rtt_dtype, scalar, embeds, from_slots, len_dtype
+        self, gen, *, bs, ps, rtt_dtype, scalar, embeds, from_slots, len_dtype, stage
     ):
         dev, n = "cuda", bs * self.DELTA
         rows = bs + 9
@@ -193,6 +200,17 @@ class _DraftLoad:
             self.buffers.append(count)
             src = torch.full((), n - 3, dtype=torch.int32, device=dev)
             self.slot = (count, src, *scalar)
+        self.stage = None
+        if stage:
+            # Strided like a sampling_info column; NaN, -0.0, inf and the bound itself.
+            temps = torch.rand((2 * bs,), generator=gen, device=dev)[::2]
+            specials = [float("nan"), -0.0, float("inf"), 1e-6, 1e-5, 0.0, 2.0, -1.0]
+            temps[: min(bs, 8)] = torch.tensor(specials[: min(bs, 8)], device=dev)
+            top_ks = rand(-1, 5, (2 * bs,), torch.int32)[::2]
+            temps_buf = torch.full((bs + 3,), -7.25, device=dev)
+            greedy_buf = torch.ones((bs + 3,), dtype=torch.bool, device=dev)
+            self.buffers += [temps_buf, greedy_buf]
+            self.stage = (temps, top_ks, temps_buf[:bs], greedy_buf[:bs], 1e-5)
         self.cache_seqlens = torch.full(
             (bs + 3,), POISON, dtype=torch.int32, device=dev
         )
@@ -221,6 +239,8 @@ class _DraftLoad:
 
     def stock(self):
         fill_slots(self.pairs, self.slot)
+        if self.stage is not None:
+            stage_sampling_params(*self.stage)
         a = self.metadata_args()
         normal_decode_set_metadata(
             a["cache_seqlens_int32"],
@@ -243,20 +263,21 @@ class TestFillSlotsThenDecodeMetadata(CustomTestCase):
     def test_one_launch_writes_what_copies_then_metadata_write(self):
         i32, i64 = torch.int32, torch.int64
         # (bs, page size, table dtype, scalar slot write, embedding rows, metadata
-        # reads the copied slots, length dtype); bs 64 with rows spans more copy
-        # programs than page columns.
+        # reads the copied slots, length dtype, sampler staging); bs 64 with rows
+        # spans more copy programs than page columns.
         cases = [
-            (1, 1, i32, None, False, True, i64),
-            (2, 16, i64, (1, 0, 0), True, True, i64),
-            (5, 64, i32, (2, 5, 37), True, True, i32),
-            (17, 16, i32, (2, 5, 37), True, False, i64),
-            (64, 1, i64, (1, 0, 0), False, True, i64),
-            (64, 16, i32, (2, 5, 37), True, True, i64),
-            (130, 64, i32, (2, 5, 37), False, True, i64),
-            (130, 16, i64, None, False, False, i32),
+            (1, 1, i32, None, False, True, i64, False),
+            (1, 16, i32, None, False, True, i64, True),
+            (2, 16, i64, (1, 0, 0), True, True, i64, True),
+            (5, 64, i32, (2, 5, 37), True, True, i32, False),
+            (17, 16, i32, (2, 5, 37), True, False, i64, True),
+            (64, 1, i64, (1, 0, 0), False, True, i64, False),
+            (64, 16, i32, (2, 5, 37), True, True, i64, True),
+            (130, 64, i32, (2, 5, 37), False, True, i64, True),
+            (130, 16, i64, None, False, False, i32, False),
         ]
         for seed, case in enumerate(cases):
-            bs, ps, rtt_dtype, scalar, embeds, from_slots, len_dtype = case
+            bs, ps, rtt_dtype, scalar, embeds, from_slots, len_dtype, stage = case
             kwargs = dict(
                 bs=bs,
                 ps=ps,
@@ -265,6 +286,7 @@ class TestFillSlotsThenDecodeMetadata(CustomTestCase):
                 embeds=embeds,
                 from_slots=from_slots,
                 len_dtype=len_dtype,
+                stage=stage,
             )
             stock, fused = (
                 _DraftLoad(torch.Generator("cuda").manual_seed(seed), **kwargs)
@@ -272,12 +294,12 @@ class TestFillSlotsThenDecodeMetadata(CustomTestCase):
             )
             stock.stock()
             taken = fill_slots_then_decode_metadata(
-                fused.pairs, fused.slot, **fused.metadata_args()
+                fused.pairs, fused.slot, **fused.metadata_args(stage=fused.stage)
             )
             with self.subTest(**kwargs):
                 self.assertTrue(taken)
                 for want, got in zip(stock.written(), fused.written()):
-                    self.assertTrue(torch.equal(want, got))
+                    self.assertTrue(torch.equal(_bits(want), _bits(got)))
 
     def test_declines_write_nothing(self):
         """Each miss would read a slot before its copy lands, convert a value the
@@ -293,6 +315,7 @@ class TestFillSlotsThenDecodeMetadata(CustomTestCase):
             embeds=False,
             from_slots=True,
             len_dtype=torch.int64,
+            stage=True,
         )
         lens_buf, rows_buf = load.buffers[2], load.buffers[3]
         loc_dst, loc_src = load.pairs[1]
@@ -322,9 +345,30 @@ class TestFillSlotsThenDecodeMetadata(CustomTestCase):
                 req_pool_indices=torch.arange(3, device="cuda")
             ),
             "host table": dict(req_to_token=load.req_to_token.cpu()),
+            "staging over a copy's destination": dict(
+                stage=(
+                    *load.stage[:2],
+                    loc_dst.view(torch.float32)[:4],
+                    *load.stage[3:],
+                )
+            ),
+            "staging over a metadata output": dict(
+                stage=(
+                    *load.stage[:3],
+                    load.cache_seqlens.view(torch.bool)[:4],
+                    load.stage[4],
+                )
+            ),
+            "staging reads a metadata output": dict(
+                stage=(load.cu_seqlens_k.view(torch.float32)[:4], *load.stage[1:])
+            ),
+            "staging outputs overlap": dict(
+                stage=(*load.stage[:3], load.stage[2].view(torch.bool)[:4], 1e-5)
+            ),
         }
         for name, overrides in misses.items():
             pairs = overrides.pop("pairs", load.pairs)
+            overrides.setdefault("stage", load.stage)
             before = [t.clone() for t in load.written()]
             with self.subTest(miss=name):
                 self.assertFalse(
@@ -333,7 +377,7 @@ class TestFillSlotsThenDecodeMetadata(CustomTestCase):
                     )
                 )
                 for want, got in zip(before, load.written()):
-                    self.assertTrue(torch.equal(want, got))
+                    self.assertTrue(torch.equal(_bits(want), _bits(got)))
 
 
 if __name__ == "__main__":
