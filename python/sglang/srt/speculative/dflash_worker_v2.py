@@ -18,6 +18,7 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
     stage_sampling_params,
 )
+from sglang.kernels.ops.speculative.dflash_accept_tail import dflash_accept_tail
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     accept_sampling,
@@ -36,6 +37,10 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.lora.layers import unwrap_lora_layer
+from sglang.srt.managers.overlap_utils import (
+    FutureRelayBuffers,
+    offer_future_relay_buffers,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -600,6 +605,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._target_worker = target_worker
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
+        # The overlap relay's seq-lens / bonus rows the accept tail writes itself; built
+        # with the pools, before the FutureMap that adopts it.
+        self._accept_tail_relay: Optional[FutureRelayBuffers] = None
         self.page_size = get_schedule().page_size
         # Normalized in arg_groups.speculative_hook.handle_speculative_decoding.
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
@@ -1062,6 +1070,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         if get_spec().speculative_dflash_draft_kv_ring:
             self._init_draft_kv_ring()
+        if is_cuda() and envs.SGLANG_OPT_DFLASH_FUSED_ACCEPT_TAIL.get():
+            self._accept_tail_relay = FutureRelayBuffers(
+                req_pool_size=self.model_runner.req_to_token_pool.req_to_token.shape[0],
+                device=self.device,
+            )
+            offer_future_relay_buffers(self._accept_tail_relay)
 
     def _init_draft_kv_ring(self) -> None:
         parallel = get_parallel()
@@ -3176,6 +3190,57 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def _fused_accept_tail_relay(
+        self,
+        *,
+        batch: ScheduleBatch,
+        on_publish,
+        new_seq_lens: Optional[torch.Tensor],
+        prefix_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+        bonus: torch.Tensor,
+    ) -> Optional[FutureRelayBuffers]:
+        """The adopted relay when the accept tail may write the step's lengths and both
+        relay rows in one launch; None for the stock add, publish and stash."""
+        relay = self._accept_tail_relay
+        if (
+            relay is None
+            or not relay.adopted
+            or on_publish is None
+            or new_seq_lens is not None
+            or self._need_mamba_verify_commit
+            or batch.beam_tail is not None
+        ):
+            return None
+        indices = batch.req_pool_indices
+        bs = int(indices.shape[0])
+        device = relay.new_seq_lens.device
+        for tensor, dtype in (
+            (indices, torch.int64),
+            (prefix_lens, torch.int64),
+            (commit_lens, torch.int32),
+            (bonus, torch.int64),
+        ):
+            if (
+                tensor.dtype != dtype
+                or tensor.dim() != 1
+                or tensor.shape[0] != bs
+                or not tensor.is_contiguous()
+                or tensor.device != device
+            ):
+                return None
+        # The kernel writes each row once: the indices must be distinct and in range.
+        host = batch.req_pool_indices_cpu
+        if (
+            host is None
+            or host.shape[0] != bs
+            or int(host.min()) < 0
+            or int(host.max()) >= relay.new_seq_lens.shape[0]
+            or int(torch.unique(host).numel()) != bs
+        ):
+            return None
+        return relay
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,
@@ -3879,6 +3944,24 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_predict=target_predict,
             cutoff_verify_lens=None if layout is None else layout.verify_lens,
         )
+        accept_tail_relay = self._fused_accept_tail_relay(
+            batch=batch,
+            on_publish=on_publish,
+            new_seq_lens=new_seq_lens,
+            prefix_lens=prefix_lens,
+            commit_lens=commit_lens,
+            bonus=bonus,
+        )
+        if accept_tail_relay is not None:
+            new_seq_lens = dflash_accept_tail(
+                prefix_lens=prefix_lens,
+                commit_lens=commit_lens,
+                bonus=bonus,
+                indices=batch.req_pool_indices,
+                new_seq_lens_buf=accept_tail_relay.new_seq_lens,
+                output_tokens_buf=accept_tail_relay.output_tokens,
+            )
+            accept_tail_relay.published_seq_lens = new_seq_lens
         commit_verify_accept(
             batch.sampling_info,
             VerifyAccept(tokens=out_tokens, accept_lens=commit_lens),
@@ -3979,6 +4062,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
+        if accept_tail_relay is not None and next_draft_input.bonus_tokens is bonus:
+            accept_tail_relay.published_bonus = bonus
 
         return GenerationBatchResult(
             logits_output=logits_output,

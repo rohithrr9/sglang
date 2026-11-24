@@ -7,7 +7,16 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.speculative.dflash import stage_sampling_params
+from sglang.kernels.ops.speculative.dflash_accept_tail import dflash_accept_tail
+from sglang.srt.managers.overlap_utils import (
+    FutureMap,
+    FutureRelayBuffers,
+    RelayPayload,
+    offer_future_relay_buffers,
+)
+from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -79,6 +88,77 @@ class TestSamplerStage(CustomTestCase):
             with self.subTest(case=name):
                 self.assertTrue(_same_bits(got.temperatures, want.temperatures))
                 self.assertTrue(torch.equal(got.greedy_mask, want.greedy_mask))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestAcceptTail(CustomTestCase):
+    # The same non-zero pattern in both relays: a row nobody writes must match too.
+    POISON = 0x5A5A5A5A5A5A5A5A
+
+    def setUp(self):
+        # stash reads the published speculative algorithm.
+        override = get_context().override_server_args(speculative_algorithm="DFLASH")
+        override.install()
+        self.addCleanup(override.restore)
+        self.addCleanup(offer_future_relay_buffers, None)
+
+    def _future_map(self, pool, relay):
+        offer_future_relay_buffers(relay)
+        future_map = FutureMap(
+            device=torch.device("cuda"),
+            spec_algo=SpeculativeAlgorithm.DFLASH,
+            req_to_token_pool=SimpleNamespace(
+                req_to_token=torch.zeros((pool, 1), device="cuda")
+            ),
+            needs_cpu_seq_lens=False,
+        )
+        future_map.new_seq_lens_buf.fill_(self.POISON)
+        future_map.output_tokens_buf.fill_(self.POISON)
+        return future_map
+
+    def test_one_launch_leaves_the_relay_publish_and_stash_leave(self):
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        pool, block = 4096, 8
+        for bs in (1, 2, 3, 5, 17, 64, 128, 129, 300):
+            prefix = torch.randint(
+                100_000, 250_000, (bs,), generator=gen, device="cuda"
+            )
+            commit = torch.randint(
+                1, block + 1, (bs,), generator=gen, device="cuda", dtype=torch.int32
+            )
+            bonus = torch.randint(0, 202048, (bs,), generator=gen, device="cuda")
+            rows = torch.randperm(pool - 1, generator=gen, device="cuda")[:bs] + 1
+
+            stock = self._future_map(pool, None)
+            want = prefix + commit.to(prefix.dtype)
+            stock.publish(rows, want)
+            stock.stash(rows, RelayPayload(bonus_tokens=bonus))
+
+            relay = FutureRelayBuffers(req_pool_size=pool, device="cuda")
+            fused = self._future_map(pool, relay)
+            got = dflash_accept_tail(
+                prefix_lens=prefix,
+                commit_lens=commit,
+                bonus=bonus,
+                indices=rows,
+                new_seq_lens_buf=relay.new_seq_lens,
+                output_tokens_buf=relay.output_tokens,
+            )
+            relay.published_seq_lens, relay.published_bonus = got, bonus
+            fused.publish(rows, got)
+            fused.stash(rows, RelayPayload(bonus_tokens=bonus))
+            with self.subTest(bs=bs):
+                self.assertTrue(relay.adopted)
+                self.assertTrue(torch.equal(got, want))
+                self.assertTrue(
+                    torch.equal(fused.new_seq_lens_buf, stock.new_seq_lens_buf)
+                )
+                self.assertTrue(
+                    torch.equal(fused.output_tokens_buf, stock.output_tokens_buf)
+                )
+                # Both scatters were skipped, so the rows above are the kernel's.
+                self.assertIsNone(relay.published_seq_lens)
+                self.assertIsNone(relay.published_bonus)
 
 
 if __name__ == "__main__":

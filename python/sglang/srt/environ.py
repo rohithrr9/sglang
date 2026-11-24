@@ -1924,6 +1924,11 @@ class Envs:
     SGLANG_OPT_DFLASH_ONE_LAUNCH_SAMPLER_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # An overlap-scheduled DFLASH decode step writes its new lengths and both relay rows
+    # in one launch after the accept; the FutureMap publish and stash skip those rows.
+    SGLANG_OPT_DFLASH_FUSED_ACCEPT_TAIL = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

@@ -6,6 +6,7 @@ from types import MethodType, SimpleNamespace
 
 import torch
 
+from sglang.srt.managers.overlap_utils import FutureRelayBuffers
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -55,6 +56,59 @@ class TestDraftTokensAlias(CustomTestCase):
                 self.assertTrue(torch.equal(blocks[True], blocks[False]))
                 self.assertTrue(torch.equal(blocks[True][:, 0], bonus))
                 self.assertTrue(torch.equal(blocks[True][:, 1:], draft_next))
+
+
+class TestFusedAcceptTailGate(CustomTestCase):
+    def test_engages_only_where_the_kernel_writes_each_row_once(self):
+        """The relay's publish and stash skip what the kernel wrote, so a step it
+        cannot write exactly (duplicate or foreign rows, other dtypes, lengths
+        already built, no overlap publish) must keep the stock tail."""
+        relay = FutureRelayBuffers(req_pool_size=8, device="cpu")
+        relay.adopted = True
+        worker = _bind(
+            SimpleNamespace(_accept_tail_relay=relay, _need_mamba_verify_commit=False),
+            "_fused_accept_tail_relay",
+        )
+
+        def call(*, host=(3, 5, 1), beam_tail=None, **overrides):
+            rows = torch.tensor([3, 5, 1])
+            kwargs = dict(
+                batch=SimpleNamespace(
+                    req_pool_indices=rows,
+                    req_pool_indices_cpu=torch.tensor(host),
+                    beam_tail=beam_tail,
+                ),
+                on_publish=print,
+                new_seq_lens=None,
+                prefix_lens=torch.tensor([10, 20, 30]),
+                commit_lens=torch.tensor([1, 2, 3], dtype=torch.int32),
+                bonus=torch.tensor([7, 8, 9]),
+            )
+            kwargs.update(overrides)
+            return worker._fused_accept_tail_relay(**kwargs)
+
+        self.assertIs(call(), relay)
+        misses = {
+            "no overlap publish": dict(on_publish=None),
+            "lengths already built": dict(new_seq_lens=torch.tensor([11, 22, 33])),
+            "int64 commit lengths": dict(commit_lens=torch.tensor([1, 2, 3])),
+            "int32 bonus": dict(bonus=torch.tensor([7, 8, 9], dtype=torch.int32)),
+            "duplicate rows": dict(host=(3, 3, 1)),
+            "row past the relay": dict(host=(3, 8, 1)),
+            "beam tail": dict(beam_tail=object()),
+        }
+        for name, overrides in misses.items():
+            with self.subTest(miss=name):
+                self.assertIsNone(call(**overrides))
+        for name, attr, value in (
+            ("mamba commit", "_need_mamba_verify_commit", True),
+            ("relay not adopted", "adopted", False),
+        ):
+            target = relay if attr == "adopted" else worker
+            setattr(target, attr, value)
+            with self.subTest(miss=name):
+                self.assertIsNone(call())
+            setattr(target, attr, not value)
 
 
 if __name__ == "__main__":
