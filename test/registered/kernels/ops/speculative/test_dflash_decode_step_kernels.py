@@ -1,5 +1,5 @@
-"""Kernels that fold launches of the DFLASH decode step: each must write exactly the
-bytes of the torch ops it replaces, and nothing outside them."""
+"""Launch folds of the DFLASH decode step on the GPU: each must write exactly the bytes
+of the torch ops it replaces, and nothing outside them."""
 
 import unittest
 from types import MethodType, SimpleNamespace
@@ -25,6 +25,8 @@ from sglang.srt.managers.overlap_utils import (
     offer_future_relay_buffers,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend
 from sglang.srt.models.muse_spark_omni import _NormalizedEmbedding
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
@@ -109,6 +111,61 @@ class TestSamplerStage(CustomTestCase):
             with self.subTest(case=name):
                 self.assertTrue(_same_bits(got.temperatures, want.temperatures))
                 self.assertTrue(torch.equal(got.greedy_mask, want.greedy_mask))
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestDrawBeforeReplay(CustomTestCase):
+    def _backend(self):
+        runner = SimpleNamespace(
+            device_module=torch.cuda, enable_profile_cuda_graph=False
+        )
+        parallel = SimpleNamespace(tp_group=SimpleNamespace(barrier=lambda: None))
+        with mock.patch.object(
+            full_cuda_graph_backend, "get_parallel", return_value=parallel
+        ):
+            return full_cuda_graph_backend.FullCudaGraphBackend(runner)
+
+    def _steps(self, *, armed, rows, cols):
+        """Three replays of a captured selector draw: each step's graph outputs and an
+        eager draw after it, then the generator state; and whether the draw left."""
+        sampler = worker_mod._SelectorDraftSampler.__new__(
+            worker_mod._SelectorDraftSampler
+        )
+        sampler.uniforms = torch.full((rows + 2, cols), -1.0, device="cuda")
+        sampler._draws_before_replay = armed
+        backend = self._backend()
+        key = ShapeKey(size=rows)
+
+        def forward():
+            uniforms = sampler._draw_uniforms(rows)
+            # A later random kernel of the graph: its offset follows the draw's.
+            return uniforms * 2.0, torch.rand((5,), device="cuda")
+
+        torch.cuda.manual_seed(1234)
+        backend.capture_one(key, forward)
+        trace = []
+        for _ in range(3):
+            trace.extend(t.clone() for t in backend.replay(key, None))
+            trace.append(torch.rand((3,), device="cuda"))
+        trace.append(torch.cuda.get_rng_state())
+        left = key in backend._replay_preludes
+        backend.cleanup()
+        return trace, left
+
+    def test_draw_before_replay_matches_the_in_graph_draw(self):
+        """An eager draw gets the generator's (seed, offset) and advances it by the
+        increment the replay of the in-graph draw applies, so every value and the
+        generator state match step by step."""
+        # 4M uniforms take several Philox rounds per thread: an increment above 4.
+        for rows, cols in ((1, 7), (8, 15), (4096, 1024)):
+            stock, stock_left = self._steps(armed=False, rows=rows, cols=cols)
+            moved, left = self._steps(armed=True, rows=rows, cols=cols)
+            with self.subTest(rows=rows, cols=cols):
+                self.assertFalse(stock_left)
+                self.assertTrue(left)
+                self.assertEqual(len(stock), len(moved))
+                for want, got in zip(stock, moved):
+                    self.assertTrue(torch.equal(want, got))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")

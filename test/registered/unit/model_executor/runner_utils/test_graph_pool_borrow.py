@@ -105,6 +105,7 @@ class TestGraphPoolBorrow(CustomTestCase):
         graph = Mock()
         backend = object.__new__(FullCudaGraphBackend)
         backend._graphs = {"shape": graph}
+        backend._replay_preludes = {}
         backend._outputs = {"shape": None}
         snapshot = [
             {

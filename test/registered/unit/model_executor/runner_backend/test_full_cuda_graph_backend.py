@@ -28,8 +28,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend
 from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
     FullCudaGraphBackend,
+    run_before_each_replay,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -56,6 +58,7 @@ def _make_backend(runner):
     touch CUDA), wiring just the attributes ``capture_one`` reads."""
     backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
     backend._graphs = {}
+    backend._replay_preludes = {}
     backend._outputs = {}
     backend._capture_inputs = {}
     backend._pool = None
@@ -247,6 +250,91 @@ class TestCaptureOneWithProfiling(CustomTestCase):
         # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
         self.assertEqual(profiler.step.call_count, 3)
         self.assertEqual(forward_fn.call_count, 3)
+
+
+class TestReplayPreludes(CustomTestCase):
+    """run_before_each_replay: a native capture may take one draw out of its graph,
+    which then runs right before every replay of that graph and of no other."""
+
+    def _capture(self, backend, shape_key, forward_fn):
+        graph = mock.Mock()
+        with mock.patch("torch.cuda.CUDAGraph", return_value=graph):
+            backend.capture_one(shape_key, forward_fn)
+        return graph
+
+    def test_taken_draw_runs_before_every_replay(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        runner.model_runner = SimpleNamespace(req_to_token_pool=None)
+        backend = _make_backend(runner)
+        events, taken = [], []
+
+        def forward_fn():
+            taken.append(
+                (
+                    run_before_each_replay(lambda: events.append("draw")),
+                    run_before_each_replay(lambda: events.append("second draw")),
+                )
+            )
+
+        graph = self._capture(backend, ShapeKey(size=4), forward_fn)
+        graph.replay.side_effect = lambda: events.append("replay")
+        # Warmups draw eagerly; a second draw stays in the graph, after the taken one.
+        self.assertEqual(taken, [(False, False), (False, False), (True, False)])
+        self.assertFalse(run_before_each_replay(lambda: None))
+        backend.replay(ShapeKey(size=4), None)
+        self.assertEqual(events, ["draw", "replay"])
+        events.clear()
+        # A step replayed until settled draws again before each replay, as in-graph.
+        with (
+            mock.patch.object(
+                full_cuda_graph_backend, "has_replay_hooks", return_value=True
+            ),
+            mock.patch.object(full_cuda_graph_backend, "save_recurrent_state"),
+            mock.patch.object(
+                full_cuda_graph_backend,
+                "replay_until_settled",
+                side_effect=lambda replay, restore: (replay(), replay()),
+            ),
+        ):
+            backend.replay(ShapeKey(size=4), SimpleNamespace(req_pool_indices=None))
+        self.assertEqual(events, ["draw", "replay"] * 3)
+
+    def test_graph_replays_only_its_own_capture_draw(self):
+        """A shape recaptured without taking a draw, or restored by Foundry (whose
+        archived graph keeps its draw), replays without the earlier capture's."""
+        backend = _make_backend(_make_runner(enable_profile=False, profiler=None))
+        key = ShapeKey(size=4)
+        events, taken = [], []
+
+        def drawing():
+            taken.append(run_before_each_replay(lambda: events.append("draw")))
+
+        for recapture in ("native", "foundry"):
+            self._capture(backend, key, drawing)
+            taken.clear()
+            if recapture == "native":
+                graph = self._capture(backend, key, lambda: None)
+            else:
+                graph = mock.Mock()
+
+                def foundry_capture_one(*, forward_fn, **_):
+                    forward_fn()
+                    return graph, None
+
+                foundry = SimpleNamespace(enabled=True, capture_one=foundry_capture_one)
+                with mock.patch.object(
+                    full_cuda_graph_backend, "get_foundry_adapter", return_value=foundry
+                ):
+                    backend.capture_one(key, drawing)
+            graph.replay.side_effect = lambda: events.append("replay")
+            events.clear()
+            backend.replay(key, None)
+            with self.subTest(recapture=recapture):
+                self.assertNotIn(True, taken)
+                self.assertEqual(events, ["replay"])
+        self._capture(backend, key, drawing)
+        backend.cleanup()
+        self.assertEqual(backend._replay_preludes, {})
 
 
 class TestCleanup(CustomTestCase):

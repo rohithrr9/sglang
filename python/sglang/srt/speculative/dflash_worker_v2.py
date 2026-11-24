@@ -69,6 +69,9 @@ from sglang.srt.model_executor.model_runner import SamplingPrewarmResult
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    run_before_each_replay,
+)
 from sglang.srt.model_executor.runner_utils.pool import (
     disable_graph_pool_borrow,
     graph_pool_borrow_enabled,
@@ -442,6 +445,10 @@ class _SelectorDraftSampler:
             and self.temperatures.is_cuda
         )
         self.uniforms = torch.empty((max_bs, gamma), dtype=torch.float32, device=device)
+        self._draws_before_replay = (
+            envs.SGLANG_OPT_DFLASH_DRAFT_DRAW_BEFORE_REPLAY.get()
+            and self.uniforms.is_cuda
+        )
         self.candidate_out = torch.empty(
             (max_bs, gamma, top_k), dtype=torch.int64, device=device
         )
@@ -513,16 +520,24 @@ class _SelectorDraftSampler:
             _SELECTOR_MIN_TEMPERATURE,
         )
 
+    def _draw_uniforms(self, bs: int) -> torch.Tensor:
+        """The path uniforms, drawn in place; a full draft graph being captured leaves
+        the draw to each of its replays (SGLANG_OPT_DFLASH_DRAFT_DRAW_BEFORE_REPLAY)."""
+        uniforms = self.uniforms[:bs]
+        if self._draws_before_replay and run_before_each_replay(uniforms.uniform_):
+            return uniforms
+        return uniforms.uniform_()
+
     def __call__(self, hidden_states, input_ids):
         bs = hidden_states.shape[0] // self.block_size
         block_ids = input_ids.view(bs, self.block_size)
         hs = hidden_states.view(bs, self.block_size, -1)[:, 1:, :]  # pos 0 = anchor
         candidate_ids, scores = _selector_lattice(self.draft_model, hs, block_ids[:, 0])
-        # In-graph philox draw: each replay advances the generator and redraws.
+        # Philox draw in the graph or right before its replay: each replay redraws.
         tokens, q_rows = self.selector.sample_path(
             candidate_ids=candidate_ids,
             scores=scores,
-            uniforms=self.uniforms[:bs].uniform_(),
+            uniforms=self._draw_uniforms(bs),
             temperatures=self.temperatures[:bs],
             greedy_mask=self.greedy_mask[:bs],
         )

@@ -18,8 +18,9 @@ torch.cuda.CUDAGraph per shape.
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, contextmanager
+from contextvars import ContextVar
 from functools import partial
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Optional
 
 import torch
 
@@ -102,6 +103,43 @@ def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
     return None
 
 
+# The replay preludes taken out of the graph being captured (run_before_each_replay).
+_capture_preludes: ContextVar[Optional[List[Callable[[], None]]]] = ContextVar(
+    "capture_preludes", default=None
+)
+
+
+def run_before_each_replay(prelude: Callable[[], None]) -> bool:
+    """Take a random draw out of the CUDA graph being captured: its backend runs
+    ``prelude`` right before each replay instead, on the replay stream. False, with
+    nothing taken, outside a FullCudaGraphBackend capture or for a second draw.
+
+    An eager draw gets the generator's (seed, offset) and advances the offset by its
+    increment, as the replay of a graph holding the draw does, so the values match
+    when it is the graph's first draw in capture order.
+    """
+    preludes = _capture_preludes.get()
+    if preludes is None or preludes:
+        return False
+    preludes.append(prelude)
+    return True
+
+
+@contextmanager
+def _collect_preludes() -> Iterator[List[Callable[[], None]]]:
+    preludes: List[Callable[[], None]] = []
+    token = _capture_preludes.set(preludes)
+    try:
+        yield preludes
+    finally:
+        _capture_preludes.reset(token)
+
+
+def _replay_after(prelude: Callable[[], None], graph: torch.cuda.CUDAGraph) -> None:
+    prelude()
+    graph.replay()
+
+
 class FullCudaGraphBackend(BaseGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
@@ -115,6 +153,7 @@ class FullCudaGraphBackend(BaseGraphBackend):
         reuse_output_buffer: bool = False,
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
+        self._replay_preludes: Dict[Any, Callable[[], None]] = {}
         self._outputs: Dict[Any, Any] = {}
         self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
@@ -160,6 +199,7 @@ class FullCudaGraphBackend(BaseGraphBackend):
             )
             if persisted is not None:
                 self._graphs[shape_key], self._outputs[shape_key] = persisted
+                self._replay_preludes.pop(shape_key, None)
                 # Restored kernels read the same dummy-batch tensors as captured ones.
                 self._capture_inputs[shape_key] = capture_inputs
                 return
@@ -219,6 +259,7 @@ class FullCudaGraphBackend(BaseGraphBackend):
 
         with (
             graph_pool_capture_scope(),
+            _collect_preludes() as preludes,
             graph_ctx(cuda_graph=graph, pool=self._pool, stream=self._capture_stream),
         ):
             self._precarve.mint()
@@ -235,6 +276,10 @@ class FullCudaGraphBackend(BaseGraphBackend):
             profiler.step()
 
         self._graphs[shape_key] = graph
+        if preludes:
+            self._replay_preludes[shape_key] = preludes[0]
+        else:
+            self._replay_preludes.pop(shape_key, None)
         self._outputs[shape_key] = out
         # Captured kernels can read tensors owned only by the dummy batch.
         self._capture_inputs[shape_key] = capture_inputs
@@ -253,21 +298,29 @@ class FullCudaGraphBackend(BaseGraphBackend):
         **kwargs,
     ) -> Any:
         with graph_pool_replay_scope():
+            graph = self._graphs[shape_key]
+            prelude = self._replay_preludes.get(shape_key)
+            replay = (
+                graph.replay
+                if prelude is None
+                else partial(_replay_after, prelude, graph)
+            )
             if not has_replay_hooks():
-                self._graphs[shape_key].replay()
+                replay()
             else:  # a step may need replaying (paged experts' disk tier)
                 restore = save_recurrent_state(
                     self._cuda_graph_runner.model_runner.req_to_token_pool,
                     static_forward_batch.req_pool_indices,
                 )
-                self._graphs[shape_key].replay()
-                replay_until_settled(self._graphs[shape_key].replay, restore)
+                replay()
+                replay_until_settled(replay, restore)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
         for graph in self._graphs.values():
             graph.reset()
         self._graphs.clear()
+        self._replay_preludes.clear()
         self._outputs.clear()
         self._capture_inputs.clear()
         self._output_buffer = None

@@ -1,6 +1,8 @@
 """DFLASH decode-step launch folds, against stub workers and CPU modules: a fold may
 drop launches, never change a value the step reads."""
 
+import contextlib
+import itertools
 import unittest
 from types import MethodType, SimpleNamespace
 from unittest import mock
@@ -19,6 +21,9 @@ from sglang.srt.managers.overlap_utils import FutureMap, FutureRelayBuffers
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
+)
+from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+    _collect_preludes,
 )
 from sglang.srt.models.muse_spark_omni import _NormalizedEmbedding
 from sglang.srt.runtime_context import get_context, get_parallel
@@ -148,6 +153,31 @@ class TestSamplerStageInDraftLoad(CustomTestCase):
                 self.assertFalse(torch.all(sampler.temperatures == -2.0))
                 if isinstance(graph_runner, DecodeCudaGraphRunner):
                     self.assertIsNone(graph_runner._held_sampler_stage)
+
+
+class TestDrawBeforeReplay(CustomTestCase):
+    def test_draw_leaves_only_an_armed_capture(self):
+        """SGLANG_OPT_DFLASH_DRAFT_DRAW_BEFORE_REPLAY: in a full-graph capture the
+        sampler hands its draw to the backend, drawing nothing, and reads the rows that
+        draw writes; unarmed or outside a capture it draws them in place."""
+        for armed, capturing in itertools.product((True, False), repeat=2):
+            sampler = _SelectorDraftSampler.__new__(_SelectorDraftSampler)
+            sampler.uniforms = torch.full((4, 3), -1.0)
+            sampler._draws_before_replay = armed
+            scope = _collect_preludes() if capturing else contextlib.nullcontext([])
+            with scope as preludes:
+                rows = sampler._draw_uniforms(2)
+            with self.subTest(armed=armed, capturing=capturing):
+                self.assertEqual(rows.data_ptr(), sampler.uniforms.data_ptr())
+                self.assertEqual(rows.shape, (2, 3))
+                if armed and capturing:
+                    self.assertEqual(len(preludes), 1)
+                    self.assertTrue(torch.all(sampler.uniforms == -1.0))
+                    preludes[0]()
+                else:
+                    self.assertEqual(preludes, [])
+                self.assertTrue(torch.all((rows >= 0) & (rows < 1)))
+                self.assertTrue(torch.all(sampler.uniforms[2:] == -1.0))
 
 
 class TestFusedAcceptTailGate(CustomTestCase):
