@@ -45,6 +45,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         )
         worker.draft_owns_attention = False
         worker._draft_block_ids_buf = None
+        worker._alias_draft_tokens = False
         worker._draft_block_spec_info = make_draft_block_spec_info(
             draft_token_num=2, device="cpu"
         )

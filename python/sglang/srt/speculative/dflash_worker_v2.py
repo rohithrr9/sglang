@@ -5,8 +5,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.kernels.ops.communication import dflash_commit as dflash_commit_op
+from sglang.kernels.ops.memory.small_copy import try_small_copy
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -763,6 +763,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_tokens_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
+        # The block-ids buffer doubles as the tokens buffer: its last reader in a step
+        # is the draft forward, and the next step's block prep rewrites every column.
+        self._alias_draft_tokens = envs.SGLANG_OPT_DFLASH_DRAFT_TOKENS_ALIAS.get()
         self._draft_verify_out_cache_loc_buf: Optional[torch.Tensor] = (
             None  # [cap_bs, block_size]
         )
@@ -1530,8 +1533,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_block_positions_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
         )
-        self._draft_block_tokens_buf = torch.empty(
-            (new_cap, block_size), dtype=torch.long, device=device
+        self._draft_block_tokens_buf = (
+            self._draft_block_ids_buf
+            if self._alias_draft_tokens
+            else torch.empty((new_cap, block_size), dtype=torch.long, device=device)
         )
         self._draft_verify_out_cache_loc_buf = torch.empty(
             (new_cap, block_size), dtype=torch.int64, device=device
@@ -1542,6 +1547,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_seq_lens_cpu_buf = torch.empty(
             (new_cap,), dtype=torch.int32, device="cpu"
         )
+
+    def _assemble_draft_tokens(
+        self, *, bs: int, block_ids: torch.Tensor, draft_next: torch.Tensor
+    ) -> torch.Tensor:
+        """The verify block: the bonus column of ``block_ids``, then the proposals."""
+        draft_tokens = self._draft_block_tokens_buf[:bs]
+        if self._alias_draft_tokens:
+            draft_tokens[:, 1:].copy_(draft_next)
+        elif not (
+            bs == 1
+            and self._batched_small_copy
+            and try_small_copy(
+                [draft_tokens[:, 0], draft_tokens[:, 1:]], [block_ids[:, 0], draft_next]
+            )
+        ):
+            draft_tokens[:, 0].copy_(block_ids[:, 0])
+            draft_tokens[:, 1:].copy_(draft_next)
+        return draft_tokens
 
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
@@ -3655,16 +3678,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                     lm_head=lm_head,
                 ).view(bs, int(self.block_size) - 1)
 
-        draft_tokens = self._draft_block_tokens_buf[:bs]
-        if not (
-            bs == 1
-            and self._batched_small_copy
-            and try_small_copy(
-                [draft_tokens[:, 0], draft_tokens[:, 1:]], [block_ids[:, 0], draft_next]
-            )
-        ):
-            draft_tokens[:, 0].copy_(block_ids[:, 0])
-            draft_tokens[:, 1:].copy_(draft_next)
+        draft_tokens = self._assemble_draft_tokens(
+            bs=bs, block_ids=block_ids, draft_next=draft_next
+        )
 
         # Must stay ahead of the target verify launch below.
         grammar_tree = (
