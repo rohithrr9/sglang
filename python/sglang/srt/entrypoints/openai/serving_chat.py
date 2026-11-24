@@ -1178,6 +1178,10 @@ class OpenAIServingChat(OpenAIServingBase):
             and not chat_encoding.spec_renders_prompt_ids(self.chat_encoding_spec)
             and not prefers_prompt_ids
         ):
+            if processed_messages.prompt_text_deferred:
+                return "text", self.tokenizer_manager.tokenizer.decode(
+                    processed_messages.prompt_ids
+                )
             return "text", processed_messages.prompt
         if isinstance(processed_messages.prompt_ids, str):
             return "text", processed_messages.prompt_ids
@@ -1970,6 +1974,7 @@ class OpenAIServingChat(OpenAIServingBase):
         prompt = ""
         prompt_ids = []
         decoded_prompt = None
+        prompt_text_deferred = False
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -2145,13 +2150,20 @@ class OpenAIServingChat(OpenAIServingBase):
                 if self._tokenizer_auto_adds_specials or add_special_tokens
                 else {}
             )
+            # Only media needs the rendered text (the MM processor expands its
+            # placeholders); a text-only request can skip the cache key and the decode.
+            needs_prompt_text = (
+                not envs.SGLANG_OPT_TEXT_ONLY_CHAT_FAST_PATH.get()
+                or bool(image_data or video_data or audio_data or modalities)
+            )
+            use_render_cache = is_multimodal and needs_prompt_text
             try:
                 prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
                     openai_compatible_messages,
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
-                    use_cache=is_multimodal,
+                    use_cache=use_render_cache,
                     add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
@@ -2168,7 +2180,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
-                        use_cache=is_multimodal,
+                        use_cache=use_render_cache,
                         add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
@@ -2186,11 +2198,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 decoded_prompt = None
 
             if is_multimodal:
-                prompt = (
-                    decoded_prompt
-                    if decoded_prompt is not None
-                    else self.tokenizer_manager.tokenizer.decode(prompt_ids)
-                )
+                if decoded_prompt is not None:
+                    prompt = decoded_prompt
+                elif needs_prompt_text:
+                    prompt = self.tokenizer_manager.tokenizer.decode(prompt_ids)
+                else:
+                    # _engine_prompt decodes it if a text prompt is sent.
+                    prompt_text_deferred = True
 
         stop = request.stop
         image_data = image_data if image_data else None
@@ -2205,6 +2219,7 @@ class OpenAIServingChat(OpenAIServingBase):
             audio_data=audio_data,
             modalities=modalities,
             stop=stop,
+            prompt_text_deferred=prompt_text_deferred,
         )
 
     def _render_and_encode_chat_template(

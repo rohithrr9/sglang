@@ -2045,6 +2045,12 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # A text-only chat request on a multimodal model reaches the engine as token ids:
+    # skip the whole-conversation render cache and decode the prompt text only where
+    # a text prompt is sent (same token ids).
+    SGLANG_OPT_TEXT_ONLY_CHAT_FAST_PATH = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

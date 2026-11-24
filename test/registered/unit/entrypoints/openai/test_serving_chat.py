@@ -846,6 +846,60 @@ class ServingChatTestCase(CustomTestCase):
         )
         self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
 
+    def _render_multimodal_twice(self, content, *, fast_path):
+        self.template_manager.chat_template_name = None
+        self.template_manager.jinja_template_content_format = "openai"
+        self.tm.tokenizer.apply_chat_template.return_value = "rendered"
+        self.tm.tokenizer.encode.return_value = [11, 12]
+        self.tm.tokenizer.decode.return_value = "decoded"
+        request = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": content}]
+        )
+        with envs.SGLANG_OPT_TEXT_ONLY_CHAT_FAST_PATH.override(fast_path):
+            return [
+                self.chat._apply_jinja_template(request, None, is_multimodal=True)
+                for _ in range(2)
+            ]
+
+    def test_text_only_fast_path_defers_the_prompt_decode_to_the_engine_prompt(self):
+        """A text-only request on a multimodal model builds no render-cache entry and
+        decodes the prompt only when a text prompt is sent, to the same text."""
+        results = self._render_multimodal_twice("Hi?", fast_path=True)
+
+        self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 2)
+        self.tm.tokenizer.decode.assert_not_called()
+        for result in results:
+            self.assertEqual(
+                (result.prompt, result.prompt_ids, result.prompt_text_deferred),
+                ("", [11, 12], True),
+            )
+        self.assertEqual(
+            self.chat._engine_prompt(results[0], is_multimodal=True),
+            ("text", "decoded"),
+        )
+        self.tm.tokenizer.decode.assert_called_once_with([11, 12])
+
+    def test_text_only_fast_path_keeps_the_rendered_text_off_or_with_media(self):
+        image = [{"type": "image_url", "image_url": {"url": "image-a"}}]
+        for content, fast_path in (("Hi?", False), (image, True)):
+            with self.subTest(content=content, fast_path=fast_path):
+                self.tm.tokenizer.reset_mock()
+                self.chat._chat_template_cache.clear()
+                results = self._render_multimodal_twice(content, fast_path=fast_path)
+
+                # The second render is the cache hit; the cached text is reused.
+                self.assertEqual(self.tm.tokenizer.apply_chat_template.call_count, 1)
+                self.tm.tokenizer.decode.assert_called_once_with([11, 12])
+                for result in results:
+                    self.assertEqual(
+                        (result.prompt, result.prompt_text_deferred),
+                        ("decoded", False),
+                    )
+                self.assertEqual(
+                    self.chat._engine_prompt(results[0], is_multimodal=True),
+                    ("text", "decoded"),
+                )
+
     def test_parsers_follow_the_control_plane_overlay(self):
         """Template detection records the parsers through `override`, so they
         answer from the bags; `ServerArgs` keeps the launcher's seed."""

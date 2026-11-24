@@ -2573,6 +2573,10 @@ class MessageProcessingResult:
     skip_special_tokens: bool = True
     require_reasoning: bool = False
     reasoning_end_token_ids: Optional[List[int]] = None
+    # True when ``prompt`` was left empty for a text-only request on a multimodal
+    # model: ``prompt_ids`` is authoritative and the text form is decoded from it
+    # only by a consumer that needs text.
+    prompt_text_deferred: bool = False
     # The tool-call constraint is the response template's own grammar.
     template_tool_call_grammar: bool = False
     # Derives the tool-call constraint for output that starts the assistant
