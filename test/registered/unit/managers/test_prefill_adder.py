@@ -562,6 +562,32 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 self.assertEqual(req.extend_len, expected)
 
+    def test_whole_fit_verify_rows_admits_exact_fits_whole(self):
+        # While DFLASH mixed verify holds rows back, a request whose exact length
+        # fits the chunk is admitted whole although its page-rounded length does
+        # not; a request that does not fit is cut as without the flag.
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 32768
+        for whole_fit, prompt_len, expected in (
+            (False, 100, 64),
+            (True, 100, 100),
+            (True, 300, 64),
+        ):
+            with self.subTest(whole_fit=whole_fit, prompt_len=prompt_len):
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    page_size=64,
+                    rem_chunk_tokens=100,
+                    whole_fit_verify_rows=whole_fit,
+                )
+                req = self.create_shared_req(f"whole-{whole_fit}-{prompt_len}")
+                req.full_untruncated_fill_ids = list(range(prompt_len))
+                adder.add_one_req(
+                    req, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(req.extend_len, expected)
+
     def test_encoder_replay_rows_share_the_chunk(self):
         # A hit's replay rows run in the same step as its extend, so both must
         # fit the chunk: the MegaMoE token cap is sized from it.

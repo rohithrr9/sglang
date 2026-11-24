@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+    from sglang.srt.speculative.dflash_mixed_verify import MixedVerifyLayout
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
@@ -756,6 +757,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # int64 (the request's replay start, 0 for other requests).
     encoder_swa_row_floor: Optional[torch.Tensor] = None
     encoder_swa_compress_rows: Optional[torch.Tensor] = None  # non-replay rows, int64
+
+    # DFLASH mixed verify: the extend rows are followed by one draft block per
+    # running request (see speculative/dflash_mixed_verify.py); None otherwise.
+    mixed_verify: Optional[MixedVerifyLayout] = None
 
     # DeepSeek-V4.1 engram, extend only: the n - 1 tokens before each request's
     # first extend token, oldest first, [bs, n - 1] int32 (see EngramHasher).

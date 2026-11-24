@@ -424,6 +424,21 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
+        elif forward_batch.mixed_verify is not None:
+            from sglang.srt.layers.attention.mixed_verify_attention import (
+                forward_mixed_verify,
+            )
+
+            return forward_mixed_verify(
+                self,
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                **kwargs,
+            )
         elif forward_batch.forward_mode.is_mixed() and is_npu():
             return self.forward_mixed(
                 q,

@@ -2240,6 +2240,8 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         static_forward_batch.encoder_swa_compress_rows = (
             forward_batch.encoder_swa_compress_rows
         )
+        # The mixed verify split runs in the eager attention regions of the replay.
+        static_forward_batch.mixed_verify = forward_batch.mixed_verify
         static_forward_batch = self.model_runner.prepare_dummy_forward_batch(
             static_forward_batch
         )

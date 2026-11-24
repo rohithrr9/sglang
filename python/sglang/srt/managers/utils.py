@@ -4,7 +4,7 @@ import dataclasses
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, List, Optional, Union
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
 import msgspec
 import torch
@@ -39,7 +39,7 @@ if TYPE_CHECKING:
         DeviceAuxiliaryOutput,
         HostAuxiliaryOutput,
     )
-    from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
     from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.observability.forward_pass_metrics import (
@@ -207,6 +207,10 @@ class GenerationBatchResult:
     # as batch_record_buf. Used for cross-stream tensor lifetime (e.g. a spec
     # V2 verify ForwardBatch whose tensors must outlive mid-iter SB rebinds).
     extra_keep_alive_refs: Optional[List[Any]] = None
+
+    # DFLASH mixed verify: the running batch whose step ran inside this extend pass,
+    # with its result; processed before this one (speculative/dflash_mixed_verify.py).
+    folded_decode: Optional[Tuple[ScheduleBatch, GenerationBatchResult]] = None
 
     # Routed experts: pending async D2H for overlap scheduling
     routed_experts_output: Optional[TopkCaptureOutput] = None

@@ -405,6 +405,11 @@ from sglang.srt.sampling.watermarking.runtime import build_watermark_rows
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.dflash_mixed_verify import (
+    DFlashMixedVerify,
+    build_dflash_mixed_verify,
+    mixed_verify_server_refusal,
+)
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -533,6 +538,8 @@ class Scheduler(
     kv_checksum_computer: Optional[KvChecksumComputer] = None
     # Unlimited-OCR collaborators; None for every other model.
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    # DFLASH mixed verify; None unless SGLANG_OPT_DFLASH_MIXED_VERIFY engages.
+    dflash_mixed_verify: Optional[DFlashMixedVerify] = None
     resolve_forward_inputs = staticmethod(resolve_forward_inputs)
     # Class-level defaults so stub schedulers built via __new__ skip the log.
     log_schedule_decisions: bool = False
@@ -762,6 +769,9 @@ class Scheduler(
 
         # Init Unlimited-OCR document-window hooks and crop transfer
         self.maybe_init_uocr_runtime()
+
+        # Init DFLASH mixed verify (the running step inside extend passes)
+        self.maybe_init_dflash_mixed_verify()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -2730,6 +2740,30 @@ class Scheduler(
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return UocrPrefillAdder if self.uocr_runtime is not None else PrefillAdder
 
+    def maybe_init_dflash_mixed_verify(self) -> None:
+        """Initialize DFLASH mixed verify: the running batch's speculative step runs
+        inside an extend pass instead of waiting for it."""
+        if not envs.SGLANG_OPT_DFLASH_MIXED_VERIFY.get():
+            return
+        self.dflash_mixed_verify = build_dflash_mixed_verify(
+            model_worker=self.model_worker,
+            target_model_runner=self._target_model_runner(),
+            server_refusal=mixed_verify_server_refusal(
+                enable_overlap=self.enable_overlap,
+                require_mlp_sync=self.require_mlp_sync,
+                enable_hisparse=self.enable_hisparse,
+                has_dllm=self.dllm_config is not None,
+                is_disaggregated=self.disaggregation_mode != DisaggregationMode.NULL,
+                pp_size=self.pp_group.world_size,
+                enable_encoder_swa_bounded_replay=(
+                    get_exec().features.enable_encoder_swa_bounded_replay
+                ),
+                enable_unified_memory=self.enable_unified_memory,
+                has_uocr_runtime=self.uocr_runtime is not None,
+                has_confidence_budget=self._confidence_budget_prepare is not None,
+            ),
+        )
+
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
 
@@ -4517,6 +4551,13 @@ class Scheduler(
         if ret:
             set_schedule_time_batch(ret)
 
+        if self.dflash_mixed_verify is not None:
+            self.dflash_mixed_verify.maybe_fold(
+                extend_batch=ret,
+                running_batch=running_batch,
+                prepare_decode=self.update_running_batch,
+            )
+
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
     def get_num_allocatable_reqs(
@@ -4738,6 +4779,12 @@ class Scheduler(
         else:
             prefill_tile_block_m = 64  # Fallback for non-Triton backends
 
+        # DFLASH mixed verify holds the running batch's verify rows out of the pass.
+        num_mixed_verify_tokens = (
+            0
+            if self.dflash_mixed_verify is None
+            else self.dflash_mixed_verify.reserved_tokens(running_batch)
+        )
         adder = self.get_prefill_adder_class()(
             self.page_size,
             self.tree_cache,
@@ -4746,7 +4793,7 @@ class Scheduler(
             self.new_token_ratio_tracker.current,
             max_prefill_tokens,
             chunked_prefill_size,
-            num_mixed_decode_tokens,
+            num_mixed_decode_tokens + num_mixed_verify_tokens,
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=int(self.max_prefill_bs),
             max_running_requests=self.max_running_requests,
@@ -4757,6 +4804,7 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
+            whole_fit_verify_rows=num_mixed_verify_tokens > 0,
         )
 
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
@@ -5448,6 +5496,93 @@ class Scheduler(
         self._on_step_forward_recorded(forward_done)
         return forward_done
 
+    def _prepare_step_sampling(self, batch: ScheduleBatch) -> None:
+        """This step's sampler params, penalties and watermark rows of ``batch``."""
+        # A beam tail's member rows follow the requests' rows; they take no params.
+        num_reqs = len(batch.reqs)
+        batch.sampling_info.set_sampler_params(
+            self.sampler_params_pool.gather(
+                batch.req_pool_indices[:num_reqs],
+                batch.req_pool_indices_cpu[:num_reqs],
+            )
+        )
+        batch.sampling_info.step_penalties = StepPenalties.build(
+            batch.reqs, self.penalty_status_pool
+        )
+        batch.sampling_info.watermark = build_watermark_rows(batch.reqs, batch.device)
+
+    def _set_output_extend_lens(
+        self, batch: ScheduleBatch, batch_result: GenerationBatchResult
+    ) -> None:
+        # These 2 values are needed for processing the output, but the values can be
+        # modified by overlap schedule. So we have to copy them here so that
+        # we can use the correct values in output processing.
+        if batch.return_logprob or batch.return_hidden_states:
+            batch_result.extend_input_len_per_req = (
+                list(batch.extend_lens) if batch.forward_mode.is_extend() else None
+            )
+        else:
+            batch_result.extend_input_len_per_req = None
+
+        if batch.return_logprob:
+            batch_result.extend_logprob_start_len_per_req = (
+                batch.extend_logprob_start_lens
+            )
+        else:
+            batch_result.extend_logprob_start_len_per_req = None
+
+    def _forward_with_folded_decode(
+        self,
+        batch: ScheduleBatch,
+        folded: ScheduleBatch,
+        *,
+        on_publish,
+        folded_launch,
+    ) -> GenerationBatchResult:
+        """The extend pass of ``batch`` that also runs the running batch ``folded``'s
+        DFLASH step. Called inside the extend batch's forward isolation on the
+        forward stream; the returned extend result carries the folded one."""
+        self.future_map.resolve_seq_lens_cpu(folded)
+        self.resolve_forward_inputs(folded, self.future_map)
+        folded_indices = folded.req_pool_indices
+        # Not recorded in the overlap ring: the extend batch's result keeps its refs.
+        with self._forward_isolation(folded, overlap=False):
+            keep_alive = [
+                folded,
+                [getattr(folded, f.name) for f in dataclasses.fields(folded)],
+            ]
+            batch_result, folded_result = (
+                self.model_worker.forward_mixed_verify_generation(
+                    extend_batch=batch,
+                    running_batch=folded,
+                    on_publish_extend=on_publish,
+                    on_publish_running=partial(self.future_map.publish, folded_indices),
+                    num_padded_verify_reqs=(
+                        self.dflash_mixed_verify.num_padded_verify_reqs(
+                            len(folded.reqs)
+                        )
+                    ),
+                    rng_steps=self.dflash_mixed_verify.rng_steps,
+                )
+            )
+        batch_result.extra_keep_alive_refs = (
+            batch_result.extra_keep_alive_refs or []
+        ) + keep_alive
+        # The folded step's post-forward bookkeeping of the overlap path.
+        folded_result.copy_done = self.device_module.Event()
+        self._relay_forward_payload(folded, folded_indices, folded_result)
+        self._copy_result_to_cpu(folded_result, folded)
+        folded.input_ids = None
+        folded.spec_info = folded_result.next_draft_input
+        folded.spec_info.future_dsa_topk_indices_available = (
+            folded.spec_info.dsa_topk_indices is not None
+        )
+        folded.spec_info.future_indices = folded_indices
+        self._set_output_extend_lens(folded, folded_result)
+        folded_result.forward_launch = folded_launch
+        batch_result.folded_decode = (folded.copy(), folded_result)
+        return batch_result
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -5456,6 +5591,13 @@ class Scheduler(
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
         launch = self._on_step_launch(batch)
+        # DFLASH mixed verify: the running batch whose step runs inside this pass.
+        folded = (
+            None
+            if self.dflash_mixed_verify is None
+            else self.dflash_mixed_verify.take_fold(batch)
+        )
+        folded_launch = None if folded is None else self._on_step_launch(folded)
 
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
@@ -5480,20 +5622,9 @@ class Scheduler(
 
         # Run forward
         if self.is_generation:
-            # A beam tail's member rows follow the requests' rows; they take no params.
-            num_reqs = len(batch.reqs)
-            batch.sampling_info.set_sampler_params(
-                self.sampler_params_pool.gather(
-                    batch.req_pool_indices[:num_reqs],
-                    batch.req_pool_indices_cpu[:num_reqs],
-                )
-            )
-            batch.sampling_info.step_penalties = StepPenalties.build(
-                batch.reqs, self.penalty_status_pool
-            )
-            batch.sampling_info.watermark = build_watermark_rows(
-                batch.reqs, batch.device
-            )
+            self._prepare_step_sampling(batch)
+            if folded is not None:
+                self._prepare_step_sampling(folded)
             if self.enable_overlap:
                 # Self-gates on batch.spec_info.future_indices; non-spec_v2
                 # no-ops (ForwardBatch.init_new lazily computes the sum).
@@ -5545,9 +5676,17 @@ class Scheduler(
                             fwd_kwargs["input_ids_from_graph"] = True
 
                         # FIXME: pp is not compatible with overlap
-                        batch_result = self.model_worker.forward_batch_generation(
-                            batch, **fwd_kwargs
-                        )
+                        if folded is None:
+                            batch_result = self.model_worker.forward_batch_generation(
+                                batch, **fwd_kwargs
+                            )
+                        else:
+                            batch_result = self._forward_with_folded_decode(
+                                batch,
+                                folded,
+                                on_publish=fwd_kwargs["on_publish"],
+                                folded_launch=folded_launch,
+                            )
                         # Deferred decode graph I/O owns this step's relay.
                         if batch.spec_algorithm.is_none() and not input_ids_from_graph:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
@@ -5736,23 +5875,7 @@ class Scheduler(
                     written_tokens=batch.out_cache_loc,
                 )
 
-            # These 2 values are needed for processing the output, but the values can be
-            # modified by overlap schedule. So we have to copy them here so that
-            # we can use the correct values in output processing.
-            if batch.return_logprob or batch.return_hidden_states:
-                batch_result.extend_input_len_per_req = (
-                    list(batch.extend_lens) if batch.forward_mode.is_extend() else None
-                )
-            else:
-                batch_result.extend_input_len_per_req = None
-
-            if batch.return_logprob:
-                batch_result.extend_logprob_start_len_per_req = (
-                    batch.extend_logprob_start_lens
-                )
-            else:
-                batch_result.extend_logprob_start_len_per_req = None
-
+            self._set_output_extend_lens(batch, batch_result)
             ret = batch_result
         else:  # embedding or reward model
             if self.enable_overlap:
@@ -5955,6 +6078,15 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if (
+            isinstance(result, GenerationBatchResult)
+            and result.folded_decode is not None
+        ):
+            # A DFLASH mixed verify pass: the running batch's step first, as if it
+            # had run before the extend pass.
+            folded_batch, folded_result = result.folded_decode
+            result.folded_decode = None
+            self.process_batch_result(folded_batch, folded_result)
         self.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.

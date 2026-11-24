@@ -1895,6 +1895,10 @@ class Envs:
     SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # Run the running batch's DFLASH step (draft block + verify) inside an extend
+    # pass instead of pausing it (speculative/dflash_mixed_verify.py). Needs the
+    # overlap scheduler and the TRT-LLM MHA backend.
+    SGLANG_OPT_DFLASH_MIXED_VERIFY = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

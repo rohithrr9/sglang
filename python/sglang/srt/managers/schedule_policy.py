@@ -1095,6 +1095,7 @@ class PrefillAdder:
         prefill_tile_block_m: int = 64,
         request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
+        whole_fit_verify_rows: bool = False,
     ):
         self.page_size = page_size
         # DCP donates a checkpoint only on the kernel chunk grid. A cut off
@@ -1130,6 +1131,9 @@ class PrefillAdder:
             )
             and not get_exec().deterministic.enable_deterministic_inference
         )
+        # DFLASH mixed verify holds rows back from the chunk: admit a request whole
+        # when its exact length fits, before cutting it by its page-rounded length.
+        self.whole_fit_verify_rows = whole_fit_verify_rows
 
         if self.dllm_config is not None:
             self._init_dllm_meta(dllm_config)
@@ -2313,13 +2317,42 @@ class PrefillAdder:
         state_slots: int = 0,
     ) -> _PrefillAdmission | AddReqResult:
         """Select a prefill shape without allocating or publishing cached KV."""
+        shape_kwargs = dict(
+            total_tokens=total_tokens,
+            host_hit_length=host_hit_length,
+            window_host_hit_lengths=window_host_hit_lengths,
+            truncation_align_size=truncation_align_size,
+            has_chunked_req=has_chunked_req,
+            state_slots=state_slots,
+        )
+        if self.whole_fit_verify_rows and not self.exact_chunk_fill:
+            # Selection allocates nothing, so the second try below is safe.
+            whole = self._select_prefill_shape(req, exact_fit=True, **shape_kwargs)
+            if isinstance(whole, _PrefillAdmission) and not whole.is_chunked:
+                return whole
+        return self._select_prefill_shape(
+            req, exact_fit=self.exact_chunk_fill, **shape_kwargs
+        )
+
+    def _select_prefill_shape(
+        self,
+        req: Req,
+        *,
+        exact_fit: bool,
+        total_tokens: int,
+        host_hit_length: int,
+        window_host_hit_lengths: Mapping[str, int],
+        truncation_align_size: Optional[int],
+        has_chunked_req: bool,
+        state_slots: int,
+    ) -> _PrefillAdmission | AddReqResult:
         prefix_len = req.prefix_len + host_hit_length
         extend_len = len(req.full_untruncated_fill_ids) - prefix_len
         input_tokens = self.ceil_paged_tokens(extend_len)
         # Whether the request fits whole. Against the raw length under
         # exact-chunk-fill, so a request whose ceiled length would spill is
         # not needlessly split into a second chunk.
-        chunk_fit_tokens = extend_len if self.exact_chunk_fill else input_tokens
+        chunk_fit_tokens = extend_len if exact_fit else input_tokens
         replay_len = self._replay_len(req, prefix_len)
         chunk_limit = self.rem_chunk_tokens
         if chunk_limit is not None and replay_len:
@@ -2366,7 +2399,7 @@ class PrefillAdder:
                 # Only one unfinished chunked request can be tracked; a
                 # continuation cut short by memory leaves chunk budget to spare.
                 return AddReqResult.OTHER
-            if self.exact_chunk_fill:
+            if exact_fit:
                 # Take the remainder verbatim so the batch hits exactly
                 # chunked_prefill_size. `chunk_fit_tokens > chunk_tokens_limit`
                 # here, so this never runs past the end of the prompt. Uses the

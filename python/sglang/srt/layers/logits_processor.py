@@ -86,6 +86,7 @@ from sglang.srt.utils.device import (
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.trie_output_head import BeamTrieOutputHead
+    from sglang.srt.speculative.dflash_mixed_verify import MixedVerifyLayout
 
 logger = logging.getLogger(__name__)
 
@@ -415,6 +416,9 @@ class LogitsMetadata:
     # TARGET_VERIFY: keep this batch's logits as vocabulary shards.
     verify_vocab_shards: bool = False
 
+    # DFLASH mixed verify pass: its extend rows, then one draft block per request.
+    mixed_verify: Optional["MixedVerifyLayout"] = None
+
     @classmethod
     def from_forward_batch(cls, forward_batch: ForwardBatch):
         # MLP-sync may turn an idle rank into a dummy EXTEND for DP prefill
@@ -481,6 +485,7 @@ class LogitsMetadata:
             dp_padding_mode=DpPaddingMode.SUM_LEN,
             mm_input_embeds=forward_batch.mm_input_embeds,
             draft_extend_select_index=draft_extend_select_index,
+            mixed_verify=forward_batch.mixed_verify,
         )
 
     def compute_dp_attention_metadata(self):
@@ -959,8 +964,19 @@ class LogitsProcessor(nn.Module):
             logits_metadata.forward_mode.is_extend()
             and not logits_metadata.extend_return_logprob
         ):
-            # Prefill without input logprobs.
-            last_index = torch.cumsum(logits_metadata.extend_seq_lens, dim=0) - 1
+            # Prefill without input logprobs. A mixed verify pass keeps every
+            # token of its draft blocks: each is pruned as one-token rows.
+            last_index = (
+                torch.cumsum(
+                    (
+                        logits_metadata.extend_seq_lens
+                        if logits_metadata.mixed_verify is None
+                        else logits_metadata.mixed_verify.prune_lens
+                    ),
+                    dim=0,
+                )
+                - 1
+            )
             pruned_states = hidden_states[last_index]
             if hidden_states_before_norm is not None:
                 pruned_states_before_norm = hidden_states_before_norm[last_index]
@@ -1257,6 +1273,10 @@ class LogitsProcessor(nn.Module):
                 and logits_metadata.forward_mode.is_target_verify()
             ):
                 return logits
+            if self.defer_verify_gather and logits_metadata.mixed_verify is not None:
+                return self._gather_mixed_verify_softcap_fused(
+                    logits, logits_metadata, use_logits_buffer
+                )
             return self._gather_softcap_fused(
                 logits, logits_metadata, use_logits_buffer
             )
@@ -1363,6 +1383,26 @@ class LogitsProcessor(nn.Module):
             and not self._can_use_tp_lm_head_all_to_all(
                 logits, local_hidden_states, lm_head, logits_metadata
             )
+        )
+
+    def _gather_mixed_verify_softcap_fused(
+        self,
+        logits: torch.Tensor,
+        logits_metadata: LogitsMetadata,
+        use_buffer: bool,
+    ) -> torch.Tensor:
+        """Gather only a mixed verify pass's extend rows; its verify rows keep this
+        rank's vocab shard, as a deferred target-verify gather leaves them."""
+        layout = logits_metadata.mixed_verify
+        num_extend = layout.num_extend_reqs
+        if logits.shape[0] != num_extend + layout.num_verify_tokens:
+            raise RuntimeError(
+                f"Mixed verify logits have {logits.shape[0]} rows, expected "
+                f"{num_extend} + {layout.num_verify_tokens}"
+            )
+        layout.verify_logits = logits[num_extend:]
+        return self._gather_softcap_fused(
+            logits[:num_extend], logits_metadata, use_buffer
         )
 
     def is_deferred_shard(self, logits: torch.Tensor) -> bool:
