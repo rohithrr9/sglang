@@ -15,6 +15,7 @@ context.
 """
 
 import dataclasses
+import itertools
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -1546,6 +1547,77 @@ class TestComputedSlots(unittest.TestCase):
                 torch.tensor([4], dtype=torch.int32),
             )
         )
+
+
+class TestFusedFillForms(unittest.TestCase):
+    """The one-launch fill of DFLASH runners writes each hook's ``post_fill_scalar``
+    form instead of running the hook, so each form must write what its hook writes."""
+
+    def _registry(self, **kwargs):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+
+        return build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=4,
+            max_num_token=8,
+            seq_len_fill_value=5,
+            cache_loc_dtype=torch.int64,
+            enable_num_token_non_padded=True,
+            share_pool=False,
+            **kwargs,
+        )
+
+    def test_scalar_forms_write_what_the_hooks_write(self):
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import FillContext
+        from sglang.srt.runtime_context import get_parallel
+
+        ctx = FillContext(raw_bs=4, padded_bs=4, raw_num_tokens=8, padded_num_tokens=8)
+        counts = [(None, None), (None, 7), (100, None), (5, 99), (3, None), (-2, None)]
+        for (global_count, local_count), sharded, rank in itertools.product(
+            counts, (False, True), range(4)
+        ):
+            with get_parallel().override(attn_tp_size=4, attn_tp_rank=rank):
+                slot = self._registry(
+                    attn_tp_sharded_fn=lambda _n, sharded=sharded: sharded
+                ).get_slot("num_token_non_padded")
+                fb = _MiniForwardBatch(
+                    num_token_non_padded=(
+                        None
+                        if local_count is None
+                        else torch.tensor([local_count], dtype=torch.int32)
+                    ),
+                    global_num_token_non_padded=(
+                        None
+                        if global_count is None
+                        else torch.tensor([global_count], dtype=torch.int32)
+                    ),
+                )
+                hooked = torch.full((1,), -77, dtype=torch.int32)
+                slot.post_fill(hooked, fb, ctx)
+                folded = torch.full((1,), -77, dtype=torch.int32)
+                fill = slot.post_fill_scalar(fb, ctx)
+                if fill is not None:
+                    folded.copy_(
+                        fill.src
+                        if fill.cap is None
+                        else torch.clamp(fill.src - fill.offset, 0, fill.cap)
+                    )
+            with self.subTest(
+                global_count=global_count, local=local_count, sharded=sharded, rank=rank
+            ):
+                self.assertTrue(torch.equal(hooked, folded))
+        for gathered in (False, True):
+            slot = self._registry(require_gathered_buffer=gathered).get_slot(
+                "global_num_tokens_gpu"
+            )
+            buf = torch.full((1,), -77, dtype=torch.int32)
+            slot.post_fill(buf, _MiniForwardBatch(), ctx)
+            with self.subTest(gathered=gathered):
+                # The gathered hook writes, so it has no scalar form to fold.
+                self.assertEqual(slot.post_fill_scalar is None, gathered)
+                self.assertEqual(int(buf.item()) != -77, gathered)
 
 
 if __name__ == "__main__":

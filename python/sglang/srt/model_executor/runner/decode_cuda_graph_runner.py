@@ -133,7 +133,7 @@ from sglang.srt.model_executor.runner_utils.pool import (
 from sglang.srt.model_executor.runner_utils.shared_read_event import make_external_event
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
-from sglang.srt.utils import empty_context, get_available_gpu_memory
+from sglang.srt.utils import empty_context, get_available_gpu_memory, is_cuda
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
@@ -607,6 +607,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             attn_tp_sharded_fn=self.model_runner.attn_tp_sequence_sharded,
             num_dp_ranks=self.num_dp_ranks,
             source=self.buffers,
+            fuse_fills=(
+                envs.SGLANG_OPT_DFLASH_ONE_LAUNCH_SLOT_FILL.get()
+                and is_cuda()
+                and self.model_runner.spec_algorithm.is_dflash_family()
+            ),
         )
         if self.dllm_input_preparation is not None:
             width = self.buffers.input_embeds.shape[-1]

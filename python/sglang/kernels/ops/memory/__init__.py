@@ -95,3 +95,11 @@ register_kernel(
         target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
     )
 )
+register_kernel(
+    KernelSpec(
+        op="memory.fill_slots",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.slot_fill:fill_slots",
+        capabilities=CUDA_ONLY,
+    )
+)

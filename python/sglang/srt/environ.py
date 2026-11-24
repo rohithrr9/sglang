@@ -1934,6 +1934,11 @@ class Envs:
     SGLANG_OPT_DFLASH_FUSED_FORK_PREP = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # A DFLASH CUDA graph runner copies an unpadded batch into its graph slots and
+    # writes the token-count slot in one launch.
+    SGLANG_OPT_DFLASH_ONE_LAUNCH_SLOT_FILL = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch

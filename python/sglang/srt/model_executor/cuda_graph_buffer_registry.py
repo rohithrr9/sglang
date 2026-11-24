@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import torch
 
 from sglang.srt.environ import envs
@@ -92,6 +93,15 @@ def _one_dense_int_pair(dsts: List[torch.Tensor], srcs: List[torch.Tensor]) -> b
     )
 
 
+def _is_int_vector_on(t: torch.Tensor, device: torch.device) -> bool:
+    return t.dtype in (torch.int32, torch.int64) and t.dim() == 1 and t.device == device
+
+
+def _no_scalar_write(forward_batch: ForwardBatch, ctx: FillContext) -> None:
+    """``post_fill_scalar`` of a hook that writes nothing."""
+    return None
+
+
 def same_tensor_view(a: torch.Tensor, b: torch.Tensor) -> bool:
     """Whether ``a`` and ``b`` view the same elements of the same storage."""
     return (
@@ -152,6 +162,15 @@ class FillContext:
     pp_proxy_tensors: Optional[Any] = None
 
 
+class ScalarSlotFill(msgspec.Struct, frozen=True):
+    """A ``post_fill`` hook's write into an int32 one-element slot: ``src`` itself, or
+    ``clamp(src - offset, 0, cap)`` when ``cap`` is set (int32 ``src`` of one element)."""
+
+    src: torch.Tensor
+    offset: int = 0
+    cap: Optional[int] = None
+
+
 @dataclass
 class GraphSlot:
     """A single FB-mirrored buffer.
@@ -202,6 +221,11 @@ class GraphSlot:
                          ``FillContext``). Returning ``None`` skips the copy for
                          that iteration. Such slots use dotted names and are
                          skipped by ``extract_buffer``.
+        post_fill_scalar — optional ``(forward_batch, FillContext) ->
+                         ScalarSlotFill | None``: what ``post_fill`` writes this
+                         iteration as one scalar op (``None``: nothing), so a
+                         fused fill can issue it in its copy launch. A slot with
+                         a ``post_fill`` but none keeps fills unfused.
     """
 
     name: str
@@ -219,6 +243,9 @@ class GraphSlot:
     slice_fn: Optional[Callable[[torch.Tensor, int], torch.Tensor]] = None
     source_fn: Optional[
         Callable[[ForwardBatch, FillContext], Optional[torch.Tensor]]
+    ] = None
+    post_fill_scalar: Optional[
+        Callable[[ForwardBatch, FillContext], Optional[ScalarSlotFill]]
     ] = None
 
     # runtime
@@ -335,6 +362,7 @@ class CudaGraphBufferRegistry:
         max_bs: int,
         max_num_tokens: int,
         share_pool: bool = False,
+        fuse_fills: bool = False,
     ) -> None:
         self.device = device
         self.max_bs = max_bs
@@ -342,6 +370,9 @@ class CudaGraphBufferRegistry:
         # Coalesce allocated slot buffers through the global pool; only applies
         # when allocating (bind/source bypasses the pool).
         self.share_pool = share_pool
+        # fill_from issues an unpadded batch's device copies and scalar hooks in one
+        # launch where its slots allow (CUDA only).
+        self.fuse_fills = fuse_fills
         self._slots: Dict[str, GraphSlot] = {}
 
     # ---- registration ------------------------------------------------------
@@ -449,6 +480,8 @@ class CudaGraphBufferRegistry:
             padded_num_tokens=padded_num_tokens,
             pp_proxy_tensors=pp_proxy_tensors,
         )
+        if self.fuse_fills and self._fill_fused(forward_batch, ctx, skip_slots):
+            return
 
         # Phase 1: reset padded regions where it matters (none when neither
         # axis is padded: reset_padding is then a no-op for every slot).
@@ -524,6 +557,104 @@ class CudaGraphBufferRegistry:
                 continue
             slot.post_fill(slot.buffer, forward_batch, ctx)
 
+    def _fill_fused(
+        self, forward_batch: ForwardBatch, ctx: FillContext, skip_slots: frozenset
+    ) -> bool:
+        """``fill_from`` with phase 2's device copies and phase 3's hooks in one launch;
+        False, with nothing written, for a call that does not qualify."""
+        if torch.cuda.is_current_stream_capturing():
+            return False
+        plan = self._plan_fused_fill(forward_batch, ctx, skip_slots)
+        if plan is None:
+            return False
+        from sglang.kernels.ops.memory.slot_fill import fill_slots
+
+        gpu_pairs, cpu_pairs, scalar = plan
+        fill_slots(gpu_pairs, scalar)
+        for dst, src in cpu_pairs:
+            dst.copy_(src)
+        return True
+
+    def _plan_fused_fill(
+        self, forward_batch: ForwardBatch, ctx: FillContext, skip_slots: frozenset
+    ):
+        """(device copies, host copies, scalar write) of ``fill_from``'s phases 2 and 3
+        for an unpadded batch whose device copies are 1-D integer slots and whose
+        hooks are scalar writes; None for any other call. Phase 1 has nothing to reset
+        without padding."""
+        if (
+            ctx.raw_bs != ctx.padded_bs
+            or ctx.raw_num_tokens != ctx.padded_num_tokens
+            or ctx.pp_proxy_tensors is not None
+        ):
+            return None
+        gpu_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        cpu_pairs: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        for slot in self._slots.values():
+            if (
+                not slot.enabled
+                or slot.buffer is None
+                or not slot.copy_from_fb
+                or slot.name in skip_slots
+            ):
+                continue
+            if slot.source_fn is not None:
+                if slot.source_fn(forward_batch, ctx) is None:
+                    continue
+                return None
+            src = getattr(forward_batch, slot.name, None)
+            if not isinstance(src, torch.Tensor):
+                continue
+            if slot.slice_fn is not None or slot.axis == "none":
+                return None
+            dst = slot.buffer[: slot._raw_n(ctx.raw_bs, ctx.raw_num_tokens)]
+            if dst.device.type == "cpu":
+                cpu_pairs.append((dst, src))
+                continue
+            if not (
+                _is_int_vector_on(dst, dst.device)
+                and _is_int_vector_on(src, dst.device)
+                and dst.is_contiguous()
+                and dst.shape == src.shape
+            ) or (dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr()):
+                return None
+            gpu_pairs.append((dst, src))
+        scalar = None
+        for slot in self._slots.values():
+            if (
+                not slot.enabled
+                or slot.buffer is None
+                or slot.post_fill is None
+                or slot.name in skip_slots
+            ):
+                continue
+            if slot.post_fill_scalar is None:
+                return None
+            fill = slot.post_fill_scalar(forward_batch, ctx)
+            if fill is None:
+                continue
+            buf = slot.buffer
+            if (
+                scalar is not None
+                or fill.src.dtype != torch.int32
+                or fill.src.numel() != 1
+                or buf.dtype != torch.int32
+                or buf.numel() != 1
+                or fill.src.device != buf.device
+            ):
+                return None
+            scalar = (
+                buf,
+                fill.src.reshape(()),
+                1 if fill.cap is None else 2,
+                fill.offset,
+                0 if fill.cap is None else fill.cap,
+            )
+        # A scalar write alone is no fewer launches than its hook.
+        if not gpu_pairs:
+            return None
+        return gpu_pairs, cpu_pairs, scalar
+
     def copy_slots(self, sources: Dict[str, torch.Tensor]) -> None:
         """``fill_from`` for an unpadded batch, by slot name: no padding reset or hooks,
         and no copy for a source that already is the slot's view."""
@@ -594,6 +725,7 @@ def build_decode_registry(
     register_global_num_tokens: bool = True,
     share_pool: bool = True,
     source: Optional[Any] = None,
+    fuse_fills: bool = False,
 ) -> CudaGraphBufferRegistry:
     """Registry mirroring the always-on (+ mamba / mrope) FB-shared decode
     buffers, with the per-slot padding policy that resets the padded tail on
@@ -621,6 +753,7 @@ def build_decode_registry(
         max_bs=max_bs,
         max_num_tokens=max_num_token,
         share_pool=share_pool,
+        fuse_fills=fuse_fills,
     )
 
     def _tokens(_bs: int, mt: int) -> Tuple[int, ...]:
@@ -712,6 +845,7 @@ def build_decode_registry(
         )
     if enable_num_token_non_padded:
         from sglang.srt.model_executor.forward_batch_info import (
+            _attn_tp_local_shard_bounds,
             compute_local_num_token_non_padded,
         )
 
@@ -739,6 +873,24 @@ def build_decode_registry(
                 )
             )
 
+        def _num_token_non_padded_scalar(fb, ctx):
+            # _num_token_non_padded_post_fill's write.
+            if fb.global_num_token_non_padded is None:
+                if fb.num_token_non_padded is None:
+                    return None
+                return ScalarSlotFill(src=fb.num_token_non_padded)
+            sharded = not enable_prefill_cp and attn_tp_sharded_fn(
+                ctx.padded_num_tokens
+            )
+            tokens_per_rank, rank_offset = _attn_tp_local_shard_bounds(
+                ctx.padded_num_tokens, sharded=sharded
+            )
+            return ScalarSlotFill(
+                src=fb.global_num_token_non_padded,
+                offset=rank_offset,
+                cap=tokens_per_rank,
+            )
+
         slots.append(
             GraphSlot(
                 "num_token_non_padded",
@@ -747,6 +899,7 @@ def build_decode_registry(
                 axis="none",
                 copy_from_fb=False,
                 post_fill=_num_token_non_padded_post_fill,
+                post_fill_scalar=_num_token_non_padded_scalar,
             )
         )
 
@@ -776,6 +929,9 @@ def build_decode_registry(
                     axis="none",
                     copy_from_fb=False,
                     post_fill=_global_num_tokens_post_fill,
+                    post_fill_scalar=(
+                        None if require_gathered_buffer else _no_scalar_write
+                    ),
                 )
             )
 
