@@ -26,6 +26,10 @@ from sglang.srt.layers.muse_spark.muse_spark_navit import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.vocab_parallel_embedding import (
+    RowGatherEmbedding,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -128,6 +132,17 @@ class _NormalizedEmbedding(nn.Module):
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self._norm(self._embedding(input_ids))
+
+    @property
+    def row_table(self) -> Optional[VocabParallelEmbedding]:
+        if isinstance(self._embedding, RowGatherEmbedding):
+            return self._embedding.row_table
+        return None
+
+    def forward_from_rows(
+        self, input_ids: torch.Tensor, rows: torch.Tensor
+    ) -> torch.Tensor:
+        return self._norm(self._embedding.forward_from_rows(input_ids, rows))
 
     @property
     def weight(self):

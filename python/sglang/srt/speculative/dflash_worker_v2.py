@@ -16,6 +16,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
     _prepare_dflash_mamba_commit,
     compute_dflash_correct_drafts_and_bonus,
+    prepare_dflash_draft_block_from_relay,
     stage_sampling_params,
 )
 from sglang.kernels.ops.speculative.dflash_accept_tail import dflash_accept_tail
@@ -36,6 +37,11 @@ from sglang.srt.layers.logits_processor import (
     should_apply_lm_head_quant_method,
 )
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.vocab_parallel_embedding import (
+    RowGatherEmbedding,
+    VocabParallelEmbedding,
+)
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.managers.overlap_utils import (
     FutureRelayBuffers,
@@ -334,6 +340,18 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
             )
         return embed_module
     return target_model.get_input_embeddings()
+
+
+def _gather_bonus_tokens(
+    *, bonus_tokens_source: torch.Tensor, draft_input: DFlashDraftInputV2
+) -> None:
+    """The resolve's ``bonus_tokens_source[future_indices]``, into the bonus tensor."""
+    torch.index_select(
+        bonus_tokens_source,
+        0,
+        draft_input.future_indices,
+        out=draft_input.bonus_tokens,
+    )
 
 
 def _is_all_greedy(sampling_info) -> bool:
@@ -774,6 +792,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._maybe_merge_trained_mask_embedding()
         self._cache_full_embed_weight()
+        # The embedding whose block rows the fork prep gathers in its launch, if any.
+        self._fork_prep_embedding: Optional[RowGatherEmbedding] = (
+            self._resolve_fork_prep_embedding()
+            if envs.SGLANG_OPT_DFLASH_FUSED_FORK_PREP.get()
+            else None
+        )
         if get_parallel().tp_rank == 0:
             logger.info(
                 "Initialized DFLASH draft runner. attention_backend=%s, model=%s, block_size=%s, draft_window_size=%s, compact_cache=%s",
@@ -1616,6 +1640,71 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tokens[:, 1:].copy_(draft_next)
         return draft_tokens
 
+    def _take_bonus_tokens_source(
+        self, draft_input: DFlashDraftInputV2
+    ) -> Optional[torch.Tensor]:
+        """The relay a resolve left the bonus gather to, when this step's Triton block
+        prep reads its rows in the launch; the bound runtime and the eager prep read
+        the gathered tensor, so for them the gather runs here."""
+        bonus_tokens_source = draft_input.bonus_tokens_source
+        draft_input.bonus_tokens_source = None
+        if bonus_tokens_source is None:
+            return None
+        if self._runtime is not None or not self._use_triton_prepare_block:
+            _gather_bonus_tokens(
+                bonus_tokens_source=bonus_tokens_source, draft_input=draft_input
+            )
+            return None
+        return bonus_tokens_source
+
+    def _prepare_block_from_relay(
+        self,
+        *,
+        bonus_tokens_source: torch.Tensor,
+        draft_input: DFlashDraftInputV2,
+        embedding: Optional[RowGatherEmbedding],
+        prefix_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        block_ids: torch.Tensor,
+        positions_2d: torch.Tensor,
+        verify_out_cache_loc_2d: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        """The resolve's bonus gather and the block prep in one launch, plus the block's
+        embedding rows with ``embedding``; returns those rows, or None."""
+        table = None if embedding is None else embedding.row_table
+        rows = None
+        vocab_bounds = None
+        if table is not None:
+            rows = torch.empty(
+                (*block_ids.shape, table.weight.shape[1]),
+                dtype=table.weight.dtype,
+                device=table.weight.device,
+            )
+            shard = table.shard_indices
+            vocab_bounds = (
+                shard.org_vocab_start_index,
+                shard.org_vocab_end_index,
+                shard.num_org_vocab_padding,
+                shard.added_vocab_start_index,
+                shard.added_vocab_end_index,
+            )
+        prepare_dflash_draft_block_from_relay(
+            output_tokens=bonus_tokens_source,
+            future_indices=draft_input.future_indices,
+            bonus_tokens_out=draft_input.bonus_tokens,
+            prefix_lens=prefix_lens.view(-1),
+            req_pool_indices=req_pool_indices.view(-1),
+            req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+            block_ids_out=block_ids,
+            positions_out=positions_2d,
+            cache_loc_out=verify_out_cache_loc_2d,
+            mask_token_id=int(self._mask_token_id),
+            embedding_weight=None if table is None else table.weight,
+            vocab_bounds=vocab_bounds,
+            embedding_out=rows,
+        )
+        return rows
+
     def __getattr__(self, name):
         # Delegate anything not implemented yet to the target worker. Guard
         # the backing field so a lookup before __init__ sets it raises
@@ -1922,6 +2011,35 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Reconstruct on the table's own group before DP ranks can go idle.
         self._full_embed_gpu = gather_draft_embedding(embedding)
+
+    def _resolve_fork_prep_embedding(self) -> Optional[RowGatherEmbedding]:
+        """The draft embedding when its forward is a row gather the fork prep can do:
+        one unquantized floating table on this rank without added vocabulary, read as
+        stored (no replicated copy, no output cast)."""
+        if self._full_embed_gpu is not None:
+            return None
+        module = unwrap_lora_layer(
+            _resolve_dflash_embedding_module(
+                self.draft_model, self._target_worker.model_runner.model
+            )
+        )
+        if not isinstance(module, RowGatherEmbedding):
+            return None
+        table = module.row_table
+        if type(table) is not VocabParallelEmbedding:
+            return None
+        weight = table.weight
+        foldable = (
+            table.tp_size == 1
+            and table.num_added_embeddings == 0
+            and isinstance(table.quant_method, UnquantizedEmbeddingMethod)
+            and weight.is_cuda
+            and weight.dim() == 2
+            and weight.stride(1) == 1
+            and weight.dtype in (torch.float16, torch.bfloat16, torch.float32)
+            and table.output_dtype in (None, weight.dtype)
+        )
+        return module if foldable else None
 
     def _resolve_mask_token_id(
         self, *, mask_token: str, mask_token_id: Optional[int] = None
@@ -3430,6 +3548,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 new_seq_lens=next_draft_input.new_seq_lens,
             )
 
+        bonus_tokens_source = self._take_bonus_tokens_source(draft_input)
         if self._runtime is not None:
             # The bound runtime runs the whole round, or returns None for the stock one.
             result = self._runtime.decode_round(
@@ -3476,24 +3595,46 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens = batch.seq_lens
         positions_2d = self._draft_block_positions_buf[:bs]
         verify_out_cache_loc_2d = self._draft_verify_out_cache_loc_buf[:bs]
+        fork_rows = None
         if self._use_triton_prepare_block:
             try:
-                _prepare_dflash_draft_block_unchecked(
-                    bonus_tokens=draft_input.bonus_tokens.view(-1),
-                    prefix_lens=prefix_lens.view(-1),
-                    req_pool_indices=batch.req_pool_indices.view(-1),
-                    req_to_token=self.model_runner.req_to_token_pool.req_to_token,
-                    block_ids_out=block_ids,
-                    positions_out=positions_2d,
-                    cache_loc_out=verify_out_cache_loc_2d,
-                    mask_token_id=int(self._mask_token_id),
-                )
+                if bonus_tokens_source is not None:
+                    fork_rows = self._prepare_block_from_relay(
+                        bonus_tokens_source=bonus_tokens_source,
+                        draft_input=draft_input,
+                        embedding=(
+                            embed_module
+                            if embed_module is self._fork_prep_embedding
+                            else None
+                        ),
+                        prefix_lens=prefix_lens,
+                        req_pool_indices=batch.req_pool_indices,
+                        block_ids=block_ids,
+                        positions_2d=positions_2d,
+                        verify_out_cache_loc_2d=verify_out_cache_loc_2d,
+                    )
+                else:
+                    _prepare_dflash_draft_block_unchecked(
+                        bonus_tokens=draft_input.bonus_tokens.view(-1),
+                        prefix_lens=prefix_lens.view(-1),
+                        req_pool_indices=batch.req_pool_indices.view(-1),
+                        req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                        block_ids_out=block_ids,
+                        positions_out=positions_2d,
+                        cache_loc_out=verify_out_cache_loc_2d,
+                        mask_token_id=int(self._mask_token_id),
+                    )
             except Exception as e:
                 self._use_triton_prepare_block = False
                 logger.warning(
                     "DFLASH Triton prepare_block failed; falling back to eager path: %s",
                     e,
                 )
+                if bonus_tokens_source is not None:
+                    _gather_bonus_tokens(
+                        bonus_tokens_source=bonus_tokens_source,
+                        draft_input=draft_input,
+                    )
                 block_ids.fill_(int(self._mask_token_id))
                 block_ids[:, 0].copy_(draft_input.bonus_tokens)
                 torch.add(
@@ -3538,6 +3679,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             noise_embedding = torch.nn.functional.embedding(
                 block_ids, self._full_embed_gpu
             )
+        elif fork_rows is not None:
+            noise_embedding = embed_module.forward_from_rows(block_ids, fork_rows)
         else:
             noise_embedding = embed_module(block_ids)
         if self._noise_embed_scale != 1.0:

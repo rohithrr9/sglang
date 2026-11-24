@@ -313,6 +313,7 @@ class FutureMap:
     """
 
     _relay = None
+    _fused_fork_prep = False
 
     def __init__(
         self,
@@ -326,6 +327,9 @@ class FutureMap:
         # CUDA-graph padded batches (req_pool_idx == 0) are harmless.
         self.device = device
         self.spec_algo = spec_algo
+        self._fused_fork_prep = (
+            envs.SGLANG_OPT_DFLASH_FUSED_FORK_PREP.get() and spec_algo.is_dflash()
+        )
         # Computed by decide_needs_cpu_seq_lens(); see that helper for the
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
@@ -618,6 +622,13 @@ class FutureMap:
             # checking the empty draft_input would silently drop them.
             if self.draft_probs_buf is not None:
                 draft_input.draft_probs = self.draft_probs_buf[indices]
+        elif self._defers_bonus_gather(batch, indices):
+            draft_input.bonus_tokens = torch.empty(
+                indices.shape,
+                dtype=self.output_tokens_buf.dtype,
+                device=self.output_tokens_buf.device,
+            )
+            draft_input.bonus_tokens_source = self.output_tokens_buf
         else:
             draft_input.bonus_tokens = self.output_tokens_buf[indices]
         if self.need_hidden_states and not self.need_topk:
@@ -631,6 +642,21 @@ class FutureMap:
             _assert_nonneg_and_invalidate(
                 draft_input.bonus_tokens, self.output_tokens_buf, indices
             )
+
+    def _defers_bonus_gather(self, batch: ScheduleBatch, indices: torch.Tensor) -> bool:
+        """A DFLASH decode batch that relays only bonus tokens leaves their gather to
+        the worker, whose fork prep reads the rows in its draft block launch."""
+        return (
+            self._fused_fork_prep
+            and not self.need_hidden_states
+            and not _DEBUG_ASSERT
+            and batch.forward_mode.is_decode()
+            and not batch.is_extend_in_batch
+            and not batch.spec_info.future_dsa_topk_indices_available
+            and indices.is_cuda
+            and indices.dtype in (torch.int32, torch.int64)
+            and indices.device == self.output_tokens_buf.device
+        )
 
     def stash_bonus_tokens(
         self, indices: torch.Tensor, bonus_tokens: torch.Tensor

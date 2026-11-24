@@ -4,7 +4,7 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple
+from typing import Optional, Protocol, Sequence, Tuple, runtime_checkable
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -178,6 +178,20 @@ def get_embedding_tp_kwargs() -> dict:
     # local tokens, so reduce within the attention-TP group, not the full TP
     # group.
     return {"enable_tp": True, "use_attn_tp_group": is_dp_attention_enabled()}
+
+
+@runtime_checkable
+class RowGatherEmbedding(Protocol):
+    """A module whose forward, when ``row_table`` is not None, reads of its weights
+    only that table's rows at its input ids; ``forward_from_rows`` then returns
+    forward's result from those rows."""
+
+    @property
+    def row_table(self) -> Optional["VocabParallelEmbedding"]: ...
+
+    def forward_from_rows(
+        self, input_: torch.Tensor, rows: torch.Tensor
+    ) -> torch.Tensor: ...
 
 
 class VocabParallelEmbedding(torch.nn.Module):
@@ -527,6 +541,24 @@ class VocabParallelEmbedding(torch.nn.Module):
                 # Reduce across all the model parallel GPUs.
                 output_parallel = tensor_model_parallel_all_reduce(output_parallel)
         return output_parallel
+
+    @property
+    def row_table(self) -> "VocabParallelEmbedding":
+        return self
+
+    def forward_from_rows(
+        self, input_: torch.Tensor, rows: torch.Tensor
+    ) -> torch.Tensor:
+        """forward() of an unsharded table whose row gather (``rows``, what the quant
+        method's embedding returns for ``input_``) was done elsewhere."""
+        if self.tp_size != 1:
+            raise ValueError("forward_from_rows needs the whole table on this rank.")
+        maybe_detect_oob(
+            input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
+        )
+        if self.output_dtype is not None:
+            rows = rows.to(self.output_dtype)
+        return rows
 
     def extra_repr(self) -> str:
         s = f"num_embeddings={self.num_embeddings_per_partition}"

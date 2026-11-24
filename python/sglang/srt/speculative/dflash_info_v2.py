@@ -57,6 +57,9 @@ class DFlashDraftInputV2(SpecInput):
 
     # Filled by scheduler after dispatch.
     future_indices: Optional[torch.Tensor] = None
+    # The relay buffer whose rows at future_indices are bonus_tokens, when the resolve
+    # left bonus_tokens unwritten for the worker's fork prep to gather.
+    bonus_tokens_source: Optional[torch.Tensor] = None
 
     verify_token_budget: Optional[int] = None
 

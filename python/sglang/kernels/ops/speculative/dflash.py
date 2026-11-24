@@ -1,4 +1,4 @@
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -296,6 +296,233 @@ def _prepare_dflash_draft_block_unchecked(
         int(mask_token_id),
         BLOCK_SIZE=block,
         num_warps=num_warps,
+    )
+
+
+@triton.jit(
+    do_not_specialize=["n_rows", "block_size", "mask_token_id", "req_to_token_width"]
+)
+def _dflash_fork_prep_kernel(
+    otb,
+    otb_stride,
+    fi,
+    fi_stride,
+    bonus_out,
+    prefix_lens,
+    prefix_lens_stride,
+    req_pool_indices,
+    req_pool_indices_stride,
+    req_to_token,
+    req_to_token_row_stride,
+    block_ids_out,
+    block_ids_row_stride,
+    positions_out,
+    positions_row_stride,
+    cache_loc_out,
+    cache_loc_row_stride,
+    req_to_token_width,
+    block_size,
+    mask_token_id,
+    n_rows,
+    weight,
+    emb_out,
+    BLOCK_SIZE: tl.constexpr,
+    EMB: tl.constexpr,
+    hidden_dim: tl.constexpr,
+    weight_stride0: tl.constexpr,
+    org_vocab_start_index: tl.constexpr,
+    org_vocab_end_index: tl.constexpr,
+    num_org_vocab_padding: tl.constexpr,
+    added_vocab_start_index: tl.constexpr,
+    added_vocab_end_index: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+):
+    """Programs (r, c) with r < n_rows (= bs * block_size with EMB, else 0): embedding row r (request r // block_size,
+    slot r % block_size), columns [c * BLOCK_H, ...). Programs (n_rows + b, 0): request b's bonus token and block row.
+    """
+    r = tl.program_id(0)
+    c = tl.program_id(1)
+    if r >= n_rows:
+        row = r - n_rows
+        if c != 0:
+            return
+        # The draft block kernel's body, its bonus token read from the relay row instead of a gathered tensor.
+        cols = tl.arange(0, BLOCK_SIZE)
+        row_mask = cols < block_size
+
+        prefix_len = tl.load(prefix_lens + row * prefix_lens_stride)
+        req_idx = tl.load(req_pool_indices + row * req_pool_indices_stride)
+        bonus_token = tl.load(otb + tl.load(fi + row * fi_stride) * otb_stride)
+        tl.store(bonus_out + row, bonus_token)
+
+        logical_pos = prefix_len.to(tl.int64) + cols
+        valid = row_mask & (logical_pos < req_to_token_width)
+        req_row_ptr = req_to_token + req_idx * req_to_token_row_stride
+        slot_ids = tl.load(req_row_ptr + logical_pos, mask=valid, other=0)
+
+        block_ids = tl.full((BLOCK_SIZE,), mask_token_id, tl.int64)
+        block_ids = tl.where(cols == 0, bonus_token.to(tl.int64), block_ids)
+        tl.store(
+            block_ids_out + row * block_ids_row_stride + cols, block_ids, mask=row_mask
+        )
+        tl.store(
+            positions_out + row * positions_row_stride + cols,
+            logical_pos,
+            mask=row_mask,
+        )
+        tl.store(
+            cache_loc_out + row * cache_loc_row_stride + cols,
+            slot_ids.to(tl.int64),
+            mask=row_mask,
+        )
+        return
+
+    if EMB:
+        # The embedding row gather's body, the token taken from the block row this launch writes.
+        b = r // block_size
+        j = r - b * block_size
+        row64 = r.to(tl.int64)
+        cols = c * BLOCK_H + tl.arange(0, BLOCK_H)
+        col_mask = cols < hidden_dim
+
+        bonus_token = tl.load(otb + tl.load(fi + b * fi_stride) * otb_stride)
+        token = tl.where(
+            j == 0, bonus_token.to(tl.int64), tl.full((), mask_token_id, tl.int64)
+        )
+        org_vocab_mask = (token >= org_vocab_start_index) & (
+            token < org_vocab_end_index
+        )
+        added_vocab_mask = (token >= added_vocab_start_index) & (
+            token < added_vocab_end_index
+        )
+        valid = org_vocab_mask | added_vocab_mask
+
+        added_offset = (
+            added_vocab_start_index
+            - (org_vocab_end_index - org_vocab_start_index)
+            - num_org_vocab_padding
+        )
+        local_id = tl.where(
+            org_vocab_mask, token - org_vocab_start_index, token - added_offset
+        )
+        local_id = tl.where(valid, local_id, 0)
+        vals = tl.load(
+            weight + local_id * weight_stride0 + cols,
+            mask=col_mask & valid,
+            other=0.0,
+        )
+        tl.store(emb_out + row64 * hidden_dim + cols, vals, mask=col_mask)
+
+
+def prepare_dflash_draft_block_from_relay(
+    *,
+    output_tokens: torch.Tensor,
+    future_indices: torch.Tensor,
+    bonus_tokens_out: torch.Tensor,
+    prefix_lens: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    req_to_token: torch.Tensor,
+    block_ids_out: torch.Tensor,
+    positions_out: torch.Tensor,
+    cache_loc_out: torch.Tensor,
+    mask_token_id: int,
+    embedding_weight: Optional[torch.Tensor] = None,
+    vocab_bounds: Optional[Tuple[int, int, int, int, int]] = None,
+    embedding_out: Optional[torch.Tensor] = None,
+) -> None:
+    """``_prepare_dflash_draft_block_unchecked`` with its bonus tokens read from the
+    overlap relay (``output_tokens[future_indices]``, also written to
+    ``bonus_tokens_out``), in one launch.
+
+    With ``embedding_weight``, the same launch writes ``embedding_out[b, j]`` = the
+    table row of block id ``[b, j]`` as one vocabulary shard gathers it (``vocab_bounds``
+    = org start, org end, org padding, added start, added end; ids outside both ranges
+    read zeros). ``future_indices`` int32 / int64 ``[bs]``; ``bonus_tokens_out``
+    contiguous ``[bs]``; the block outputs as the unfused kernel takes them;
+    ``embedding_out`` contiguous ``[bs, block_size, hidden]`` of the table's dtype.
+    """
+    bs = int(bonus_tokens_out.numel())
+    if bs == 0:
+        return
+    if req_to_token.ndim != 2 or req_to_token.stride(1) != 1:
+        raise ValueError("DFLASH Triton prepare_block requires row-major req_to_token.")
+    for name, out in (
+        ("block_ids_out", block_ids_out),
+        ("positions_out", positions_out),
+        ("cache_loc_out", cache_loc_out),
+    ):
+        if not _is_row_major_contiguous_2d(out):
+            raise ValueError(f"DFLASH Triton prepare_block requires contiguous {name}.")
+    if not bonus_tokens_out.is_contiguous():
+        raise ValueError("DFLASH fork prep requires contiguous bonus_tokens_out.")
+    block_size = int(block_ids_out.shape[1])
+    if embedding_weight is not None:
+        if not (
+            embedding_out is not None
+            and embedding_out.is_contiguous()
+            and embedding_weight.stride(1) == 1
+            and tuple(embedding_out.shape)
+            == (bs, block_size, int(embedding_weight.shape[1]))
+        ):
+            raise ValueError("DFLASH fork prep: embedding layout mismatch.")
+        hidden = int(embedding_weight.shape[1])
+        block_h = min(1024, triton.next_power_of_2(hidden))
+        ncol = triton.cdiv(hidden, block_h)
+        org_start, org_end, org_padding, added_start, added_end = vocab_bounds
+        consts = dict(
+            hidden_dim=hidden,
+            weight_stride0=int(embedding_weight.stride(0)),
+            org_vocab_start_index=int(org_start),
+            org_vocab_end_index=int(org_end),
+            num_org_vocab_padding=int(org_padding),
+            added_vocab_start_index=int(added_start),
+            added_vocab_end_index=int(added_end),
+            BLOCK_H=block_h,
+        )
+        weight, out = embedding_weight, embedding_out
+        rows = bs * block_size
+    else:
+        ncol = 1
+        consts = dict(
+            hidden_dim=1,
+            weight_stride0=1,
+            org_vocab_start_index=0,
+            org_vocab_end_index=0,
+            num_org_vocab_padding=0,
+            added_vocab_start_index=0,
+            added_vocab_end_index=0,
+            BLOCK_H=16,
+        )
+        weight, out = block_ids_out, block_ids_out
+        rows = 0
+    _dflash_fork_prep_kernel[(rows + bs, ncol)](
+        output_tokens,
+        output_tokens.stride(0),
+        future_indices,
+        future_indices.stride(0),
+        bonus_tokens_out,
+        prefix_lens,
+        prefix_lens.stride(0),
+        req_pool_indices,
+        req_pool_indices.stride(0),
+        req_to_token,
+        req_to_token.stride(0),
+        block_ids_out,
+        block_ids_out.stride(0),
+        positions_out,
+        positions_out.stride(0),
+        cache_loc_out,
+        cache_loc_out.stride(0),
+        int(req_to_token.shape[1]),
+        block_size,
+        int(mask_token_id),
+        rows,
+        weight,
+        out,
+        BLOCK_SIZE=triton.next_power_of_2(block_size),
+        EMB=1 if embedding_weight is not None else 0,
+        num_warps=8,
+        **consts,
     )
 
 

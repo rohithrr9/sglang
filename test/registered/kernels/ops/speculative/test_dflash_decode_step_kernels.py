@@ -2,31 +2,52 @@
 bytes of the torch ops it replaces, and nothing outside them."""
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
+from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.speculative.dflash import stage_sampling_params
+from sglang.kernels.ops.speculative.dflash import (
+    _prepare_dflash_draft_block_unchecked,
+    stage_sampling_params,
+)
 from sglang.kernels.ops.speculative.dflash_accept_tail import dflash_accept_tail
+from sglang.srt.environ import envs
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
+from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.overlap_utils import (
     FutureMap,
     FutureRelayBuffers,
     RelayPayload,
     offer_future_relay_buffers,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.muse_spark_omni import _NormalizedEmbedding
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _same_bits(a: torch.Tensor, b: torch.Tensor) -> bool:
     if a.dtype == torch.float32:
         a, b = a.view(torch.int32), b.view(torch.int32)
     return a.dtype == b.dtype and torch.equal(a, b)
+
+
+def _bind(worker, *names):
+    for name in names:
+        setattr(
+            worker, name, MethodType(getattr(worker_mod.DFlashWorkerV2, name), worker)
+        )
+    return worker
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -159,6 +180,208 @@ class TestAcceptTail(CustomTestCase):
                 # Both scatters were skipped, so the rows above are the kernel's.
                 self.assertIsNone(relay.published_seq_lens)
                 self.assertIsNone(relay.published_bonus)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestForkPrep(CustomTestCase):
+    # Hidden spans two column blocks of the row gather, the second one partial.
+    POOL, WIDTH, BLOCK, MASK, VOCAB, HIDDEN = 512, 1024, 8, 5, 1000, 1088
+
+    def setUp(self):
+        enter_scope(self, published_topology("test", tp_size=1, pp_size=1))
+        enter_scope(self, get_parallel().override(tp_group=None))
+        # CI runs with the relay's debug asserts, which keep the resolve's gather.
+        enter_scope(self, mock.patch.object(overlap_utils, "_DEBUG_ASSERT", False))
+
+    def _table(self, dtype, **kwargs):
+        table = VocabParallelEmbedding(
+            self.VOCAB, self.HIDDEN, params_dtype=dtype, **kwargs
+        ).cuda()
+        with torch.no_grad():
+            table.weight.normal_(generator=torch.Generator("cuda").manual_seed(0))
+        return table
+
+    def _future_map(self, *, fused, relay_tokens):
+        with envs.SGLANG_OPT_DFLASH_FUSED_FORK_PREP.override(fused):
+            future_map = FutureMap(
+                device=torch.device("cuda"),
+                spec_algo=SpeculativeAlgorithm.DFLASH,
+                req_to_token_pool=SimpleNamespace(
+                    req_to_token=torch.zeros((self.POOL, 1), device="cuda")
+                ),
+                needs_cpu_seq_lens=False,
+            )
+        future_map.output_tokens_buf.copy_(relay_tokens)
+        return future_map
+
+    def _resolve(self, future_map, future_indices):
+        draft_input = DFlashDraftInputV2.create_idle_input(device="cuda")
+        draft_input.future_indices = future_indices
+        future_map._resolve_spec_extras(
+            SimpleNamespace(
+                spec_info=draft_input,
+                forward_mode=ForwardMode.DECODE,
+                is_extend_in_batch=False,
+            )
+        )
+        return draft_input
+
+    def _block_buffers(self, bs):
+        # Two spare rows past the batch: the launch must not write them.
+        return [
+            torch.full((bs + 2, self.BLOCK), -9, dtype=torch.int64, device="cuda")
+            for _ in range(3)
+        ]
+
+    def test_resolve_and_one_launch_write_the_stock_gather_block_and_rows(self):
+        gen = torch.Generator("cuda").manual_seed(0)
+        tables = {
+            dtype: self._table(dtype) for dtype in (torch.bfloat16, torch.float32)
+        }
+        for bs in (1, 2, 3, 5, 17, 64, 129):
+            req_to_token = torch.randint(
+                0, 1 << 30, (self.POOL, self.WIDTH), generator=gen, device="cuda"
+            ).to(torch.int32)
+            relay_tokens = torch.randint(
+                0, self.VOCAB, (self.POOL,), generator=gen, device="cuda"
+            )
+            req_pool_indices = torch.randperm(self.POOL, generator=gen, device="cuda")[
+                :bs
+            ]
+            future_indices = torch.randperm(self.POOL, generator=gen, device="cuda")[
+                :bs
+            ]
+            prefix_lens = torch.randint(
+                0, self.WIDTH, (bs,), generator=gen, device="cuda"
+            )
+            # A block running past the req_to_token row reads slot 0 there.
+            prefix_lens[0] = self.WIDTH - 3
+            stock_input = self._resolve(
+                self._future_map(fused=False, relay_tokens=relay_tokens),
+                future_indices,
+            )
+            want = self._block_buffers(bs)
+            _prepare_dflash_draft_block_unchecked(
+                bonus_tokens=stock_input.bonus_tokens,
+                prefix_lens=prefix_lens,
+                req_pool_indices=req_pool_indices,
+                req_to_token=req_to_token,
+                block_ids_out=want[0][:bs],
+                positions_out=want[1][:bs],
+                cache_loc_out=want[2][:bs],
+                mask_token_id=self.MASK,
+            )
+            worker = _bind(
+                SimpleNamespace(
+                    model_runner=SimpleNamespace(
+                        req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+                    ),
+                    _mask_token_id=self.MASK,
+                    _runtime=None,
+                    _use_triton_prepare_block=True,
+                ),
+                "_take_bonus_tokens_source",
+                "_prepare_block_from_relay",
+            )
+            cases = [("no rows", None, None, torch.int64)]
+            for dtype, table in tables.items():
+                wrapper = _NormalizedEmbedding(table, torch.nn.Identity())
+                cases += [(f"{dtype} table", table, table, torch.int32)]
+                cases += [(f"{dtype} wrapper", wrapper, table, torch.int64)]
+            for name, embedding, table, index_dtype in cases:
+                fused_map = self._future_map(fused=True, relay_tokens=relay_tokens)
+                fused_input = self._resolve(fused_map, future_indices.to(index_dtype))
+                with self.subTest(bs=bs, case=name):
+                    self.assertIs(
+                        fused_input.bonus_tokens_source, fused_map.output_tokens_buf
+                    )
+                    source = worker._take_bonus_tokens_source(fused_input)
+                    self.assertIs(source, fused_map.output_tokens_buf)
+                    got = self._block_buffers(bs)
+                    rows = worker._prepare_block_from_relay(
+                        bonus_tokens_source=source,
+                        draft_input=fused_input,
+                        embedding=embedding,
+                        prefix_lens=prefix_lens,
+                        req_pool_indices=req_pool_indices,
+                        block_ids=got[0][:bs],
+                        positions_2d=got[1][:bs],
+                        verify_out_cache_loc_2d=got[2][:bs],
+                    )
+                    self.assertTrue(
+                        torch.equal(fused_input.bonus_tokens, stock_input.bonus_tokens)
+                    )
+                    for got_buf, want_buf in zip(got, want):
+                        self.assertTrue(torch.equal(got_buf, want_buf))
+                    if table is None:
+                        self.assertIsNone(rows)
+                    else:
+                        self.assertTrue(torch.equal(rows, table(want[0][:bs])))
+
+    def test_fold_takes_only_one_whole_unquantized_table(self):
+        def resolve(module, **fields):
+            model = SimpleNamespace(get_input_embeddings=lambda: module)
+            worker = SimpleNamespace(
+                _full_embed_gpu=None,
+                draft_model=SimpleNamespace(),
+                _target_worker=SimpleNamespace(
+                    model_runner=SimpleNamespace(model=model)
+                ),
+            )
+            for name, value in fields.items():
+                setattr(worker, name, value)
+            return _bind(
+                worker, "_resolve_fork_prep_embedding"
+            )._resolve_fork_prep_embedding()
+
+        table = self._table(torch.bfloat16)
+        wrapper = _NormalizedEmbedding(table, torch.nn.Identity())
+        self.assertIs(resolve(table), table)
+        self.assertIs(resolve(wrapper), wrapper)
+        half = self._table(torch.float16)
+        self.assertIs(resolve(half), half)
+        plain = torch.nn.Embedding(8, 4).cuda()
+        misses = {
+            "replicated table": (table, dict(_full_embed_gpu=table.weight)),
+            "plain embedding": (plain, {}),
+            "wrapper of a plain embedding": (
+                _NormalizedEmbedding(plain, torch.nn.Identity()),
+                {},
+            ),
+            "lm head": (ParallelLMHead(self.VOCAB, self.HIDDEN).cuda(), {}),
+            "table on the host": (VocabParallelEmbedding(self.VOCAB, self.HIDDEN), {}),
+            "output cast": (
+                self._table(torch.bfloat16, output_dtype=torch.float32),
+                {},
+            ),
+        }
+        rows = table.weight.shape[0]
+        for name, attr, value in (
+            ("sharded", "tp_size", 2),
+            ("added vocabulary", "num_added_embeddings", 1),
+            ("quantized", "quant_method", SimpleNamespace()),
+            (
+                "integer table",
+                "weight",
+                torch.nn.Parameter(
+                    torch.zeros((rows, 4), dtype=torch.int8, device="cuda"),
+                    requires_grad=False,
+                ),
+            ),
+            (
+                "strided table",
+                "weight",
+                torch.nn.Parameter(
+                    torch.zeros((4, rows), device="cuda").t(), requires_grad=False
+                ),
+            ),
+        ):
+            changed = self._table(torch.bfloat16)
+            setattr(changed, attr, value)
+            misses[name] = (changed, {})
+        for name, (module, fields) in misses.items():
+            with self.subTest(miss=name):
+                self.assertIsNone(resolve(module, **fields))
 
 
 if __name__ == "__main__":

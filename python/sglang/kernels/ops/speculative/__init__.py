@@ -23,6 +23,7 @@ _TRITON_KERNELS = [
     ("cache_locs", "generate_draft_decode_window_kv_indices"),
     ("dflash", "compute_dflash_correct_drafts_and_bonus"),
     ("dflash", "stage_sampling_params"),
+    ("dflash", "prepare_dflash_draft_block_from_relay"),
     ("eagle", "fill_bonus_tokens"),
     ("eagle", "fill_accept_out_cache_loc"),
     ("gather_spec_extras", "gather_spec_extras"),
